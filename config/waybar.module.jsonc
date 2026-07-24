@@ -1,6 +1,6 @@
 // >>> claude-dash
 // Add "custom/claude" to modules-right, then paste this block alongside the
-// other custom modules. __BIN__ is replaced by install.sh.
+// other custom modules. The bin directory below is filled in by install.sh.
 "custom/claude": {
   "format": "󰚩 {}",
   "return-type": "json",
