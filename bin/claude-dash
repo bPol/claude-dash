@@ -78,7 +78,13 @@ fi
 printf '%s' "$$" >"$PIDFILE" 2>/dev/null
 
 cleanup() {
-  rm -f "$PIDFILE" 2>/dev/null
+  # Only remove pidfile if it still contains this process's PID.
+  # If another board instance has already overwritten it, leave it alone.
+  local stored_pid
+  stored_pid=$(cat "$PIDFILE" 2>/dev/null || printf '')
+  if [[ "$stored_pid" == "$$" ]]; then
+    rm -f "$PIDFILE" 2>/dev/null
+  fi
   printf '\e[?25h\e[?1049l'   # cursor back, leave the alternate screen
   exit 0
 }

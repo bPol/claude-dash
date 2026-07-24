@@ -368,4 +368,45 @@ check "non-tty loop sleeps instead of spinning" \
   "$([[ $frames -lt 50 ]] && echo bounded || echo spinning)" "bounded"
 rm -rf "$(dirname "$p")"
 
+printf '\nclaude-dash: pidfile cleanup with multiple instances\n'
+
+# Test that cleanup only removes pidfile if it contains this process's PID.
+# Bug: the first board to exit unconditionally removes the pidfile, even if
+# it now contains a different (still-running) board's PID.
+test_pidfile=$(mktemp "${TMPDIR:-/tmp}/claude-dash-test-pid.XXXXXX")
+p=$(producer_stub '[]')
+
+# Start first board in background, let it write its pidfile
+CLAUDE_DASH_PIDFILE="$test_pidfile" CLAUDE_DASH_PRODUCER=$p timeout 10 "$BIN/claude-dash" </dev/null >/dev/null 2>&1 &
+job_a=$!
+sleep 0.3  # let it write the pidfile
+
+pid_a=$(cat "$test_pidfile" 2>/dev/null || printf '')
+[[ -n $pid_a ]] && check "first board wrote to pidfile" "yes" "yes" || check "first board wrote to pidfile" "no" "yes"
+
+# Start second board in background, let it overwrite pidfile
+CLAUDE_DASH_PIDFILE="$test_pidfile" CLAUDE_DASH_PRODUCER=$p timeout 10 "$BIN/claude-dash" </dev/null >/dev/null 2>&1 &
+job_b=$!
+sleep 0.3  # let it write the pidfile, overwriting the first
+
+pid_b=$(cat "$test_pidfile" 2>/dev/null || printf '')
+check "second board overwrote pidfile" "$([[ "$pid_b" != "$pid_a" ]] && printf yes || printf no)" "yes"
+
+# Kill the first board
+kill "$job_a" 2>/dev/null || true
+wait "$job_a" 2>/dev/null || true
+sleep 0.2
+
+# Check if pidfile still exists and still contains second board's pid
+pid_after_kill=$(cat "$test_pidfile" 2>/dev/null || printf '')
+check "pidfile still exists after first board exits" "$([ -n "$pid_after_kill" ] && printf yes || printf no)" "yes"
+check "pidfile still contains second board's pid" "$pid_after_kill" "$pid_b"
+
+# Clean up second board
+kill "$job_b" 2>/dev/null || true
+wait "$job_b" 2>/dev/null || true
+
+rm -f "$test_pidfile"
+rm -rf "$(dirname "$p")"
+
 summary
