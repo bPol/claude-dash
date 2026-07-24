@@ -9,6 +9,10 @@ JOBS_DIR=$ROOT/jobs
 HOST=${CLAUDE_DASH_HOST:-$(uname -n)}
 NOW=$(date +%s%3N)
 
+CLI=${CLAUDE_DASH_CLI:-claude}
+STAMP=${CLAUDE_DASH_STAMP:-${XDG_RUNTIME_DIR:-/tmp}/claude-dash-arbitrated}
+ARBITRATE_EVERY=${CLAUDE_DASH_ARBITRATE_EVERY:-60}
+
 # proc_start PID — field 22 of /proc/PID/stat, non-zero exit if the pid is gone.
 # NOTE: `$(</proc/N/stat 2>/dev/null)` returns an EMPTY STRING successfully --
 # the redirection defeats bash's special read-a-file form. Check readability
@@ -20,6 +24,43 @@ proc_start() {
   rest=${raw#*') '}          # drop "PID (comm) "; comm may contain spaces
   read -ra fields <<<"$rest"
   printf '%s' "${fields[19]}"
+}
+
+# arbitration_due — true when the last CLI cross-check is older than the floor.
+arbitration_due() {
+  local now stamp_age
+  [[ -f $STAMP ]] || return 0
+  now=$(date +%s)
+  stamp_age=$((now - $(stat -c %Y "$STAMP" 2>/dev/null || printf '0')))
+  ((stamp_age >= ARBITRATE_EVERY))
+}
+
+# cli_sessions — normalized array from `claude agents --json`; non-zero on failure.
+cli_sessions() {
+  local raw
+  command -v "$CLI" >/dev/null 2>&1 || return 1
+  raw=$("$CLI" agents --json 2>/dev/null) || return 1
+  [[ -n $raw ]] || return 1
+  jq -c '
+    def rank:
+      if .state == "blocked" then 0
+      elif .working then 1
+      else 2 end;
+    [ .[]
+      | { kind:    (if .kind == "interactive" then "interactive" else "bg" end),
+          pid:     .pid,
+          name:    (.name // "(unnamed)"),
+          cwd:     (.cwd // ""),
+          status:  (.status // "idle"),
+          working: ((.status // "idle") | . == "busy" or . == "shell"),
+          state:   (.state // null),
+          needs:   null,
+          idle_ms: null,
+          job_id:  (.id // null) } ]
+    | map(. + { finished: (.kind == "bg" and (.state == "done" or .state == "error")) })
+    | sort_by( (if .finished then 1 else 0 end),
+               (if .kind == "interactive" then 0 else 1 end),
+               rank, 0 )' <<<"$raw" 2>/dev/null
 }
 
 # emit DEGRADED UNREADABLE SESSIONS_JSON
@@ -129,6 +170,28 @@ if ((${#live[@]})); then
     sessions='[]'
     ((${#records[@]})) && sessions=$(printf '%s\n' "${records[@]}" \
       | jq -c -s --argjson now "$NOW" --argjson jobs "$jobs_map" "$JQ_RECORD_DEF"'order')
+  fi
+fi
+
+# Path 1: no registry at all.
+if [[ ! -d $SESSIONS_DIR ]]; then
+  if fallback=$(cli_sessions) && [[ -n $fallback ]]; then
+    emit true "$unreadable" "$fallback"
+    exit 0
+  fi
+  emit true "$unreadable" '[]'
+  exit 0
+fi
+
+# Path 2: registry parsed but empty. Indistinguishable from "nothing running"
+# by inspection, so arbitrate against the CLI -- at most once per minute,
+# because that call costs ~0.5s and ~300MB.
+if [[ $sessions == '[]' ]] && arbitration_due; then
+  mkdir -p "$(dirname "$STAMP")" 2>/dev/null
+  : >"$STAMP"
+  if fallback=$(cli_sessions) && [[ $(jq -r 'length' <<<"$fallback" 2>/dev/null || printf '0') -gt 0 ]]; then
+    emit true "$unreadable" "$fallback"
+    exit 0
   fi
 fi
 

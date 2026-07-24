@@ -145,4 +145,63 @@ check "status shell is still reported literally" \
   "$(jq -r '.sessions[0].status' <<<"$out")" "shell"
 rm -rf "$root"
 
+printf '\nclaude-sessions: degraded mode\n'
+
+# A stub standing in for `claude agents --json`.
+stub_dir=$(mktemp -d "${TMPDIR:-/tmp}/claude-dash-stub.XXXXXX")
+cat >"$stub_dir/claude" <<'STUB'
+#!/usr/bin/env bash
+[[ "$1" == "agents" ]] || exit 1
+cat <<'JSON'
+[{"pid":490201,"cwd":"/home/u/projects/demo","kind":"interactive",
+  "startedAt":1784794917430,"sessionId":"x","name":"from cli","status":"busy"}]
+JSON
+STUB
+chmod +x "$stub_dir/claude"
+
+root=$(new_root)
+rm -rf "$root/sessions"        # registry gone entirely
+out=$(CLAUDE_DASH_ROOT=$root CLAUDE_DASH_CLI=$stub_dir/claude \
+      CLAUDE_DASH_STAMP=$root/stamp "$BIN/claude-sessions")
+check "missing registry falls back to the CLI" \
+  "$(jq -r '.sessions[0].name' <<<"$out")" "from cli"
+check "fallback sets degraded" "$(jq -r '.degraded' <<<"$out")" "true"
+check "fallback leaves idle_ms null" "$(jq -r '.sessions[0].idle_ms' <<<"$out")" "null"
+rm -rf "$root"
+
+root=$(new_root)                # registry present, parses, but empty
+out=$(CLAUDE_DASH_ROOT=$root CLAUDE_DASH_CLI=$stub_dir/claude \
+      CLAUDE_DASH_STAMP=$root/stamp "$BIN/claude-sessions")
+check "empty registry contradicted by the CLI goes degraded" \
+  "$(jq -r '.degraded' <<<"$out")" "true"
+check "arbitration writes a stamp file" \
+  "$([[ -f $root/stamp ]] && echo yes || echo no)" "yes"
+out=$(CLAUDE_DASH_ROOT=$root CLAUDE_DASH_CLI=/nonexistent/claude \
+      CLAUDE_DASH_STAMP=$root/stamp "$BIN/claude-sessions")
+check "fresh stamp suppresses a second arbitration" \
+  "$(jq -r '.degraded' <<<"$out")" "false"
+rm -rf "$root"
+
+root=$(new_root)                # registry empty and the CLI agrees
+cat >"$stub_dir/claude-empty" <<'STUB'
+#!/usr/bin/env bash
+printf '[]\n'
+STUB
+chmod +x "$stub_dir/claude-empty"
+out=$(CLAUDE_DASH_ROOT=$root CLAUDE_DASH_CLI=$stub_dir/claude-empty \
+      CLAUDE_DASH_STAMP=$root/stamp "$BIN/claude-sessions")
+check "genuine zero is not degraded" "$(jq -r '.degraded' <<<"$out")" "false"
+check "genuine zero has no sessions" "$(jq -r '.sessions | length' <<<"$out")" "0"
+rm -rf "$root"
+
+root=$(new_root)                # CLI itself broken, registry gone
+out=$(CLAUDE_DASH_ROOT=$root CLAUDE_DASH_CLI=/nonexistent/claude \
+      CLAUDE_DASH_STAMP=$root/stamp "$BIN/claude-sessions")
+rm -rf "$root/sessions"
+check "both sources failing still emits valid JSON" \
+  "$(jq -r '.sessions | length' <<<"$out")" "0"
+rm -rf "$root"
+
+rm -rf "$stub_dir"
+
 summary
