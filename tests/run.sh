@@ -59,4 +59,22 @@ check "name is stripped of control chars and markup-escaped" \
   "$(jq -r '.sessions[0].name' <<<"$out")" "a&lt;b&gt;c[31md"
 rm -rf "$root"
 
+# A file that PASSES the bash pre-filter (real "pid":N / "procStart":"N" for
+# a live pid) but is truncated/invalid JSON must not sink the whole batch:
+# only the bad file should be lost, not every good session alongside it.
+root=$(new_root)
+mk_session "$root" "$$" interactive "good" busy 1000
+sleep 60 &
+corrupt_pid=$!
+corrupt_start=$(proc_start_of "$corrupt_pid")
+printf '{"pid":%d,"sessionId":"s-%d","cwd":"/home/u/projects/demo","startedAt":1,"procStart":"%s","version":"2.1.219","kind":"interactive","entrypoint":"cli","name":"trunc' \
+  "$corrupt_pid" "$corrupt_pid" "$corrupt_start" >"$root/sessions/$corrupt_pid.json"
+out=$(CLAUDE_DASH_ROOT=$root "$BIN/claude-sessions")
+check "good session survives a truncated sibling that passes the pre-filter" \
+  "$(jq -r '.sessions | length' <<<"$out")" "1"
+check "truncated sibling is counted as unreadable" "$(jq -r '.unreadable' <<<"$out")" "1"
+kill "$corrupt_pid" 2>/dev/null
+wait "$corrupt_pid" 2>/dev/null
+rm -rf "$root"
+
 summary

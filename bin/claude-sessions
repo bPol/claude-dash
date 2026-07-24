@@ -51,29 +51,53 @@ if [[ -d $SESSIONS_DIR ]]; then
   shopt -u nullglob
 fi
 
+# Session names and agent questions are LLM-authored free text. They are
+# rendered into a Pango-markup tooltip and a terminal frame, so strip
+# control characters and escape markup once, here, for every consumer.
+# Shared between the batch and per-file jq programs below so both stay in
+# sync; `record` reads $now from --argjson, bound in both invocations.
+# shellcheck disable=SC2016 # single-quoted on purpose: these are jq $vars, not bash's
+JQ_RECORD_DEF='
+def clean:
+  if . == null then null
+  else gsub("[[:cntrl:]]"; "")
+       | gsub("&"; "&amp;") | gsub("<"; "&lt;") | gsub(">"; "&gt;")
+  end;
+def record:
+  { kind:    (if .kind == "bg" then "bg" else "interactive" end),
+    pid:     .pid,
+    name:    ((.name // "(unnamed)") | clean),
+    cwd:     (.cwd // ""),
+    status:  (.status // "idle"),
+    working: ((.status // "idle") | . == "busy" or . == "shell"),
+    state:   null,
+    needs:   null,
+    idle_ms: ($now - (.statusUpdatedAt // .updatedAt // $now)),
+    job_id:  (.jobId // null) };
+'
+
 sessions='[]'
 if ((${#live[@]})); then
-  sessions=$(jq -c -n --argjson now "$NOW" '
-    # Session names and agent questions are LLM-authored free text. They are
-    # rendered into a Pango-markup tooltip and a terminal frame, so strip
-    # control characters and escape markup once, here, for every consumer.
-    def clean:
-      if . == null then null
-      else gsub("[[:cntrl:]]"; "")
-           | gsub("&"; "&amp;") | gsub("<"; "&lt;") | gsub(">"; "&gt;")
-      end;
-
-    [ inputs
-      | { kind:    (if .kind == "bg" then "bg" else "interactive" end),
-          pid:     .pid,
-          name:    ((.name // "(unnamed)") | clean),
-          cwd:     (.cwd // ""),
-          status:  (.status // "idle"),
-          working: ((.status // "idle") | . == "busy" or . == "shell"),
-          state:   null,
-          needs:   null,
-          idle_ms: ($now - (.statusUpdatedAt // .updatedAt // $now)),
-          job_id:  (.jobId // null) } ]' "${live[@]}" 2>/dev/null) || sessions='[]'
+  if sessions=$(jq -c -n --argjson now "$NOW" \
+      "$JQ_RECORD_DEF"'[ inputs | record ]' "${live[@]}" 2>/dev/null); then
+    : # common case: the whole live set parsed in one batched call
+  else
+    # One file in the batch was unreadable JSON, and jq has no partial-batch
+    # mode -- a single bad file fails the whole call. Re-run per file instead:
+    # slower, but only taken in this rare corrupt case, and it charges the
+    # bad file alone to `unreadable` rather than losing every good session.
+    records=()
+    for file in "${live[@]}"; do
+      if record=$(jq -c --argjson now "$NOW" \
+          "$JQ_RECORD_DEF"'record' "$file" 2>/dev/null); then
+        records+=("$record")
+      else
+        unreadable=$((unreadable + 1))
+      fi
+    done
+    sessions='[]'
+    ((${#records[@]})) && sessions=$(printf '%s\n' "${records[@]}" | jq -c -s '.')
+  fi
 fi
 
 emit false "$unreadable" "$sessions"
