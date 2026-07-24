@@ -7,6 +7,19 @@ source "$HERE/lib.sh"
 BIN=$HERE/../bin
 DEAD_PID=4194303   # above /proc/sys/kernel/pid_max default, can never be live
 
+# Hermetic by default: no test may reach the real `claude` binary or the real
+# shared arbitration stamp (${XDG_RUNTIME_DIR}/claude-dash-arbitrated), even
+# one that forgets to override. An empty/all-dead fixture legitimately
+# triggers Task 3's arbitration in production, but in tests that must land on
+# a CLI that can't exist and a stamp confined to this run's own temp dir, not
+# the machine's real CLI or shared stamp. Tests that deliberately exercise
+# degraded mode override both explicitly on the command line, which take
+# precedence over these exports.
+RUN_TMP=$(mktemp -d "${TMPDIR:-/tmp}/claude-dash-run.XXXXXX")
+trap 'rm -rf "$RUN_TMP"' EXIT
+export CLAUDE_DASH_CLI="$RUN_TMP/no-such-claude"
+export CLAUDE_DASH_STAMP="$RUN_TMP/stamp"
+
 printf 'claude-sessions: liveness\n'
 
 root=$(new_root)
