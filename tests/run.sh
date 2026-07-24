@@ -105,6 +105,23 @@ check "blocked agent is not finished" \
   "$(jq -r '.sessions[0].finished' <<<"$out")" "false"
 rm -rf "$root"
 
+# jobs_map is built from every jobs/*/state.json in one pass; if a single
+# unrelated job file is corrupt, a live blocked session's OWN job state must
+# not be lost with it -- only the corrupt file itself should cost anything.
+root=$(new_root)
+mk_session "$root" "$$" bg "blocked one" idle 5000 j-live
+mk_job "$root" j-live blocked "please answer"
+mkdir -p "$root/jobs/j-corrupt"
+printf '{"state":"blocked"' >"$root/jobs/j-corrupt/state.json"   # truncated/corrupt
+out=$(CLAUDE_DASH_ROOT=$root "$BIN/claude-sessions")
+check "a corrupt unrelated job file does not blind a live session's state" \
+  "$(jq -r '.sessions[0].state' <<<"$out")" "blocked"
+check "a corrupt unrelated job file does not blind a live session's needs" \
+  "$(jq -r '.sessions[0].needs' <<<"$out")" "please answer"
+check "the corrupt unrelated job file is counted as unreadable" \
+  "$(jq -r '.unreadable' <<<"$out")" "1"
+rm -rf "$root"
+
 root=$(new_root)
 mk_session "$root" "$$" bg "sales" idle 950400000 j-done
 # shellcheck disable=SC1010 # "done" here is the job state arg, not the loop keyword
@@ -187,6 +204,55 @@ check "orphan blocked row is not working" \
   "$(jq -r '.sessions[0].working' <<<"$out")" "false"
 check "orphan blocked job_id is the job directory name" \
   "$(jq -r '.sessions[0].job_id' <<<"$out")" "j-orphan-blocked"
+rm -rf "$root"
+
+# job_row's name and needs are job-authored free text same as a session's,
+# rendered into the same Pango-markup tooltip -- they must go through `clean`
+# too, not just the session path's fields.
+root=$(new_root)
+mk_orphan_job "$root" j-orphan-markup blocked \
+  "$(printf 'fix <b>bug</b>\033[31m')" "/home/u/x" \
+  "$(printf 'ok <i>now</i>\aplease')"
+out=$(CLAUDE_DASH_ROOT=$root "$BIN/claude-sessions")
+check "orphan job name is markup-escaped and stripped of control chars" \
+  "$(jq -r '.sessions[0].name' <<<"$out")" "fix &lt;b&gt;bug&lt;/b&gt;[31m"
+check "orphan job needs is markup-escaped and stripped of control chars" \
+  "$(jq -r '.sessions[0].needs' <<<"$out")" "ok &lt;i&gt;now&lt;/i&gt;please"
+rm -rf "$root"
+
+# cwd is not agent-authored the way name/needs are, but it still comes off
+# disk verbatim and reaches the same Pango tooltip and terminal frame, so it
+# must be sanitised too -- on the job-derived path here, and the
+# session-derived path below.
+root=$(new_root)
+mk_orphan_job "$root" j-orphan-cwd blocked "cwd test" \
+  "$(printf '/home/u/<script>\033[31m')" "ok"
+out=$(CLAUDE_DASH_ROOT=$root "$BIN/claude-sessions")
+check "orphan job cwd is markup-escaped and stripped of control chars" \
+  "$(jq -r '.sessions[0].cwd' <<<"$out")" "/home/u/&lt;script&gt;[31m"
+rm -rf "$root"
+
+root=$(new_root)
+cwd_json=$(printf '/home/u/<script>\033[31m' | jq -Rs .)
+now=$(date +%s%3N)
+printf '{"pid":%d,"sessionId":"s-%d","cwd":%s,"startedAt":%d,"procStart":"%s","version":"2.1.219","kind":"interactive","entrypoint":"cli","name":"cwd test","status":"idle","updatedAt":%d,"statusUpdatedAt":%d}\n' \
+  "$$" "$$" "$cwd_json" "$now" "$(proc_start_of "$$")" "$now" "$now" >"$root/sessions/$$.json"
+out=$(CLAUDE_DASH_ROOT=$root "$BIN/claude-sessions")
+check "session cwd is markup-escaped and stripped of control chars" \
+  "$(jq -r '.sessions[0].cwd' <<<"$out")" "/home/u/&lt;script&gt;[31m"
+rm -rf "$root"
+
+# A state.json that parses but has no usable `.state` (an empty object, or a
+# file caught mid-write) must not read as busy forever -- that phantom row is
+# the whole reason a corrupt/incomplete job file is dangerous here.
+root=$(new_root)
+mkdir -p "$root/jobs/j-empty"
+printf '{}' >"$root/jobs/j-empty/state.json"
+out=$(CLAUDE_DASH_ROOT=$root "$BIN/claude-sessions")
+check "a job with no usable state is not working" \
+  "$(jq -r '.sessions[0].working' <<<"$out")" "false"
+check "a job with no usable state has null state" \
+  "$(jq -r '.sessions[0].state' <<<"$out")" "null"
 rm -rf "$root"
 
 root=$(new_root)
@@ -419,8 +485,6 @@ p=$(producer_stub '[
 out=$(CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash-badge")
 check "a row that is both working and blocked counts once, as blocked" \
   "$(jq -r '.text' <<<"$out")" "1▸1▸1"
-check "busy + blocked + idle sums to the unfinished session count" \
-  "$(jq -r '.text | split("▸") | map(tonumber) | add' <<<"$out")" "3"
 rm -rf "$(dirname "$p")"
 
 printf '\nclaude-dash board\n'

@@ -92,18 +92,6 @@ if [[ -d $SESSIONS_DIR ]]; then
   shopt -u nullglob
 fi
 
-# Map job id -> {state, needs}. `input_filename` names the file jq is reading,
-# so the parent directory gives the job id in a single jq invocation.
-jobs_map='{}'
-if compgen -G "$JOBS_DIR/*/state.json" >/dev/null 2>&1; then
-  jobs_map=$(jq -n '
-    [ inputs
-      | { key:   (input_filename | split("/")[-2]),
-          value: { state: (.state // null), needs: (.needs // null) } } ]
-    | from_entries' "$JOBS_DIR"/*/state.json 2>/dev/null) || jobs_map='{}'
-  [[ -n $jobs_map ]] || jobs_map='{}'
-fi
-
 # Session names and agent questions are LLM-authored free text. They are
 # rendered into a Pango-markup tooltip and a terminal frame, so strip
 # control characters and escape markup once, here, for every consumer --
@@ -137,11 +125,14 @@ def record:
   | { kind:    (if $s.kind == "bg" then "bg" else "interactive" end),
       pid:     $s.pid,
       name:    (($s.name // "(unnamed)") | clean),
-      cwd:     ($s.cwd // ""),
+      cwd:     (($s.cwd // "") | clean),
       status:  ($s.status // "idle"),
       working: (($s.status // "idle") | . == "busy" or . == "shell"),
       state:   ($j.state // null),
-      needs:   (($j.needs // null) | clean),
+      # $j comes from $jobs (== jobs_map, projected from job_rows below), whose
+      # needs text already went through `clean` inside job_row -- cleaning it
+      # again here would double-escape markup (`&lt;` -> `&amp;lt;`).
+      needs:   ($j.needs // null),
       idle_ms: ($now - ($s.statusUpdatedAt // $s.updatedAt // $now)),
       job_id:  ($s.jobId // null) }
   | . + { finished: (.kind == "bg" and (.state == "done" or .state == "error")) };
@@ -164,15 +155,79 @@ def job_row($id; $mt):
   | { kind:    "bg",
       pid:     null,
       name:    (($j.name // $id) | clean),
-      cwd:     ($j.cwd // ""),
+      cwd:     (($j.cwd // "") | clean),
+      # A state.json with no usable `.state` (an empty object, or a file
+      # caught mid-write) must not read as busy forever: only a state we
+      # recognise as active makes the row working, never an absent one.
       status:  ($j.tempo // $j.state // "idle"),
-      working: (($j.state // "") as $st | ($st != "blocked" and $st != "done")),
+      working: (($j.state // null) as $st | ($st != null and $st != "blocked" and $st != "done" and $st != "error")),
       state:   ($j.state // null),
       needs:   (($j.needs // null) | clean),
       idle_ms: ($now - (if ($j.updatedAt | type) == "number" then $j.updatedAt else $mt end)),
       job_id:  $id }
   | . + { finished: (.state == "done" or .state == "error") };
 '
+
+# jobs/*/state.json is a row source in its own right, not just a lookup: a
+# background agent whose process has already exited -- including one that is
+# blocked and waiting on the user -- leaves a job directory with NO session
+# file at all, so it never appears via `record` above no matter what.
+# `jobs_map` (job id -> {state, needs}, consumed by `record` to enrich a live
+# session row) is built as a PROJECTION of `job_rows`, not a second parse of
+# the job files: that way a job's state/needs only ever come from a file that
+# has already parsed successfully into job_rows, so one corrupt file can
+# never blind an unrelated session's lookup the way a from-scratch batch call
+# over all job files -- with its single all-or-nothing failure mode -- would.
+# `mtimes` is a single `stat` call over every state.json file (not one
+# process per job dir), feeding job_row's idle_ms fallback for the common
+# case where .updatedAt is an ISO-8601 string rather than a numeric epoch
+# timestamp; the fallback below reuses this same map instead of re-`stat`ing
+# per file.
+job_rows='[]'
+jobs_map='{}'
+if compgen -G "$JOBS_DIR/*/state.json" >/dev/null 2>&1; then
+  mtimes=$(stat -c $'%n\t%Y' "$JOBS_DIR"/*/state.json 2>/dev/null)
+  if job_rows=$(jq -c -n --argjson now "$NOW" --arg mtimes "$mtimes" \
+      "$JQ_RECORD_DEF"'
+        ( $mtimes | split("\n") | map(select(length > 0) | split("\t"))
+            | map({ key: (.[0] | split("/")[-2]), value: ((.[1] | tonumber) * 1000) })
+            | from_entries ) as $mt
+        | [ inputs | (input_filename | split("/")[-2]) as $id
+            | job_row($id; ($mt[$id] // $now)) ]
+      ' "$JOBS_DIR"/*/state.json 2>/dev/null); then
+    : # common case: every job file parsed in one batched call
+  else
+    # One job file was unreadable JSON, and jq has no partial-batch mode -- a
+    # single bad file fails the whole call. Re-run per file instead, exactly
+    # like the session fallback above: one jq call per file (no per-dir
+    # `stat` -- $mtimes above already covers every file in a single process
+    # -- and no per-item append call), collected with `printf | jq -s` at the
+    # end so a corrupt file among N job dirs costs one process, not three.
+    declare -A job_mtime=()
+    while IFS=$'\t' read -r fn ts; do
+      [[ -n $fn ]] || continue
+      id=${fn%/state.json}; id=${id##*/}
+      job_mtime[$id]=$((ts * 1000))
+    done <<<"$mtimes"
+    job_rows='[]'
+    records=()
+    for jf in "$JOBS_DIR"/*/state.json; do
+      id=${jf%/state.json}; id=${id##*/}
+      mt=${job_mtime[$id]:-$NOW}
+      if record=$(jq -c --argjson now "$NOW" --argjson mt "$mt" --arg id "$id" \
+          "$JQ_RECORD_DEF"'job_row($id; $mt)' "$jf" 2>/dev/null); then
+        records+=("$record")
+      else
+        unreadable=$((unreadable + 1))
+      fi
+    done
+    ((${#records[@]})) && job_rows=$(printf '%s\n' "${records[@]}" \
+      | jq -c -s --argjson now "$NOW" "$JQ_RECORD_DEF"'order')
+  fi
+  [[ $job_rows != '[]' ]] && jobs_map=$(jq -c \
+    'map(select(.job_id != null) | {key: .job_id, value: {state, needs}}) | from_entries' \
+    <<<"$job_rows")
+fi
 
 sessions='[]'
 if ((${#live[@]})); then
@@ -196,44 +251,6 @@ if ((${#live[@]})); then
     sessions='[]'
     ((${#records[@]})) && sessions=$(printf '%s\n' "${records[@]}" \
       | jq -c -s --argjson now "$NOW" --argjson jobs "$jobs_map" "$JQ_RECORD_DEF"'order')
-  fi
-fi
-
-# jobs/*/state.json is a row source in its own right, not just the lookup
-# `jobs_map` feeds into `record` above: a background agent whose process has
-# already exited -- including one that is blocked and waiting on the user --
-# leaves a job directory with NO session file at all, so it never appears in
-# `sessions` above no matter what. `mtimes` is a single `stat` call over every
-# state.json file (not one process per job dir), feeding job_row's idle_ms
-# fallback for the common case where .updatedAt is an ISO-8601 string rather
-# than a numeric epoch timestamp.
-job_rows='[]'
-if compgen -G "$JOBS_DIR/*/state.json" >/dev/null 2>&1; then
-  mtimes=$(stat -c $'%n\t%Y' "$JOBS_DIR"/*/state.json 2>/dev/null)
-  if job_rows=$(jq -c -n --argjson now "$NOW" --arg mtimes "$mtimes" \
-      "$JQ_RECORD_DEF"'
-        ( $mtimes | split("\n") | map(select(length > 0) | split("\t"))
-            | map({ key: (.[0] | split("/")[-2]), value: ((.[1] | tonumber) * 1000) })
-            | from_entries ) as $mt
-        | [ inputs | (input_filename | split("/")[-2]) as $id
-            | job_row($id; ($mt[$id] // $now)) ]
-      ' "$JOBS_DIR"/*/state.json 2>/dev/null); then
-    : # common case: every job file parsed in one batched call
-  else
-    # Same rare-corruption fallback as the session batch above: one bad job
-    # file must not sink every other job's row.
-    job_rows='[]'
-    for jf in "$JOBS_DIR"/*/state.json; do
-      id=${jf%/state.json}; id=${id##*/}
-      mt=$(stat -c %Y "$jf" 2>/dev/null) || mt=0
-      mt=$((mt * 1000))
-      if row=$(jq -c --argjson now "$NOW" --argjson mt "$mt" --arg id "$id" \
-          "$JQ_RECORD_DEF"'job_row($id; $mt)' "$jf" 2>/dev/null); then
-        job_rows=$(jq -c --argjson r "$row" '. + [$r]' <<<"$job_rows")
-      else
-        unreadable=$((unreadable + 1))
-      fi
-    done
   fi
 fi
 
