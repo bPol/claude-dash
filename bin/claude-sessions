@@ -5,6 +5,7 @@ set -uo pipefail
 
 ROOT=${CLAUDE_DASH_ROOT:-$HOME/.claude}
 SESSIONS_DIR=$ROOT/sessions
+JOBS_DIR=$ROOT/jobs
 HOST=${CLAUDE_DASH_HOST:-$(uname -n)}
 NOW=$(date +%s%3N)
 
@@ -51,6 +52,18 @@ if [[ -d $SESSIONS_DIR ]]; then
   shopt -u nullglob
 fi
 
+# Map job id -> {state, needs}. `input_filename` names the file jq is reading,
+# so the parent directory gives the job id in a single jq invocation.
+jobs_map='{}'
+if compgen -G "$JOBS_DIR/*/state.json" >/dev/null 2>&1; then
+  jobs_map=$(jq -n '
+    [ inputs
+      | { key:   (input_filename | split("/")[-2]),
+          value: { state: (.state // null), needs: (.needs // null) } } ]
+    | from_entries' "$JOBS_DIR"/*/state.json 2>/dev/null) || jobs_map='{}'
+  [[ -n $jobs_map ]] || jobs_map='{}'
+fi
+
 # Session names and agent questions are LLM-authored free text. They are
 # rendered into a Pango-markup tooltip and a terminal frame, so strip
 # control characters and escape markup once, here, for every consumer.
@@ -63,23 +76,41 @@ def clean:
   else gsub("[[:cntrl:]]"; "")
        | gsub("&"; "&amp;") | gsub("<"; "&lt;") | gsub(">"; "&gt;")
   end;
+# `shell` means the session is running a command, so it counts as working.
+# Derived once here; no consumer re-derives it from .status.
+def rank:
+  if .state == "blocked" then 0
+  elif .working then 1
+  else 2 end;
 def record:
-  { kind:    (if .kind == "bg" then "bg" else "interactive" end),
-    pid:     .pid,
-    name:    ((.name // "(unnamed)") | clean),
-    cwd:     (.cwd // ""),
-    status:  (.status // "idle"),
-    working: ((.status // "idle") | . == "busy" or . == "shell"),
-    state:   null,
-    needs:   null,
-    idle_ms: ($now - (.statusUpdatedAt // .updatedAt // $now)),
-    job_id:  (.jobId // null) };
+  . as $s
+  | (if $s.jobId then ($jobs[$s.jobId] // {}) else {} end) as $j
+  | { kind:    (if $s.kind == "bg" then "bg" else "interactive" end),
+      pid:     $s.pid,
+      name:    (($s.name // "(unnamed)") | clean),
+      cwd:     ($s.cwd // ""),
+      status:  ($s.status // "idle"),
+      working: (($s.status // "idle") | . == "busy" or . == "shell"),
+      state:   ($j.state // null),
+      needs:   (($j.needs // null) | clean),
+      idle_ms: ($now - ($s.statusUpdatedAt // $s.updatedAt // $now)),
+      job_id:  ($s.jobId // null) }
+  | . + { finished: (.kind == "bg" and (.state == "done" or .state == "error")) };
+# Display order, applied to the assembled array identically on the batch and
+# per-file fallback paths: unfinished before finished, interactive before
+# background, then blocked before busy before idle, then most recently
+# active first.
+def order:
+  sort_by( (if .finished then 1 else 0 end),
+           (if .kind == "interactive" then 0 else 1 end),
+           rank,
+           (.idle_ms // 0) );
 '
 
 sessions='[]'
 if ((${#live[@]})); then
-  if sessions=$(jq -c -n --argjson now "$NOW" \
-      "$JQ_RECORD_DEF"'[ inputs | record ]' "${live[@]}" 2>/dev/null); then
+  if sessions=$(jq -c -n --argjson now "$NOW" --argjson jobs "$jobs_map" \
+      "$JQ_RECORD_DEF"'[ inputs | record ] | order' "${live[@]}" 2>/dev/null); then
     : # common case: the whole live set parsed in one batched call
   else
     # One file in the batch was unreadable JSON, and jq has no partial-batch
@@ -88,7 +119,7 @@ if ((${#live[@]})); then
     # bad file alone to `unreadable` rather than losing every good session.
     records=()
     for file in "${live[@]}"; do
-      if record=$(jq -c --argjson now "$NOW" \
+      if record=$(jq -c --argjson now "$NOW" --argjson jobs "$jobs_map" \
           "$JQ_RECORD_DEF"'record' "$file" 2>/dev/null); then
         records+=("$record")
       else
@@ -96,7 +127,8 @@ if ((${#live[@]})); then
       fi
     done
     sessions='[]'
-    ((${#records[@]})) && sessions=$(printf '%s\n' "${records[@]}" | jq -c -s '.')
+    ((${#records[@]})) && sessions=$(printf '%s\n' "${records[@]}" \
+      | jq -c -s --argjson now "$NOW" --argjson jobs "$jobs_map" "$JQ_RECORD_DEF"'order')
   fi
 fi
 

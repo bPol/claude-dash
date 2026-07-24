@@ -77,4 +77,72 @@ kill "$corrupt_pid" 2>/dev/null
 wait "$corrupt_pid" 2>/dev/null
 rm -rf "$root"
 
+printf '\nclaude-sessions: background state and ordering\n'
+
+root=$(new_root)
+mk_session "$root" "$$" bg "typo clarification" idle 360000 j-blocked
+mk_job "$root" j-blocked blocked "did you mean \`exit\` or \`edit\`?"
+out=$(CLAUDE_DASH_ROOT=$root "$BIN/claude-sessions")
+check "background state is merged from the job file" \
+  "$(jq -r '.sessions[0].state' <<<"$out")" "blocked"
+# shellcheck disable=SC2016 # single-quoted on purpose: literal backticks, not command substitution
+check "needs text is merged" \
+  "$(jq -r '.sessions[0].needs' <<<"$out")" 'did you mean `exit` or `edit`?'
+check "blocked agent is not finished" \
+  "$(jq -r '.sessions[0].finished' <<<"$out")" "false"
+rm -rf "$root"
+
+root=$(new_root)
+mk_session "$root" "$$" bg "sales" idle 950400000 j-done
+# shellcheck disable=SC1010 # "done" here is the job state arg, not the loop keyword
+mk_job "$root" j-done done
+out=$(CLAUDE_DASH_ROOT=$root "$BIN/claude-sessions")
+check "done agent is marked finished" \
+  "$(jq -r '.sessions[0].finished' <<<"$out")" "true"
+rm -rf "$root"
+
+root=$(new_root)
+mk_session "$root" "$$" bg "orphan" idle 1000 j-missing
+mkdir -p "$root/jobs/j-missing"     # job dir with no state.json, as seen live
+out=$(CLAUDE_DASH_ROOT=$root "$BIN/claude-sessions")
+check "job dir without state.json still lists the session" \
+  "$(jq -r '.sessions | length' <<<"$out")" "1"
+check "missing state.json leaves state null" \
+  "$(jq -r '.sessions[0].state' <<<"$out")" "null"
+rm -rf "$root"
+
+root=$(new_root)
+mk_session "$root" "$$" bg "blocked agent" idle 5000 j-b
+mk_job "$root" j-b blocked "answer me"
+mk_session "$root" 1 interactive "idle interactive" idle 5000
+out=$(CLAUDE_DASH_ROOT=$root "$BIN/claude-sessions")
+check "interactive sorts above background" \
+  "$(jq -r '.sessions[0].kind' <<<"$out")" "interactive"
+rm -rf "$root"
+
+root=$(new_root)
+mk_session "$root" "$$" interactive "stale idle" idle 600000
+mk_session "$root" 1 interactive "fresh idle" idle 5000
+out=$(CLAUDE_DASH_ROOT=$root "$BIN/claude-sessions")
+check "most recently active sorts first" \
+  "$(jq -r '.sessions[0].name' <<<"$out")" "fresh idle"
+rm -rf "$root"
+
+root=$(new_root)
+mk_session "$root" "$$" bg "markup asker" idle 1000 j-markup
+mk_job "$root" j-markup blocked "$(printf 'use <div> or <section>?\033[0m')"
+out=$(CLAUDE_DASH_ROOT=$root "$BIN/claude-sessions")
+check "needs text is markup-escaped and stripped of control chars" \
+  "$(jq -r '.sessions[0].needs' <<<"$out")" "use &lt;div&gt; or &lt;section&gt;?[0m"
+rm -rf "$root"
+
+root=$(new_root)
+mk_session "$root" "$$" interactive "in a shell command" shell 1000
+out=$(CLAUDE_DASH_ROOT=$root "$BIN/claude-sessions")
+check "status shell counts as working" \
+  "$(jq -r '.sessions[0].working' <<<"$out")" "true"
+check "status shell is still reported literally" \
+  "$(jq -r '.sessions[0].status' <<<"$out")" "shell"
+rm -rf "$root"
+
 summary
