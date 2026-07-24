@@ -29,7 +29,18 @@ frame() {
       elif . < 3600000 then "\((. / 60000 | floor))m"
       elif . < 86400000 then "\((. / 3600000 | floor))h"
       else "\((. / 86400000 | floor))d" end;
-    def pad($n): (.[0:$n] | . + (" " * ($n - length)));
+    # pad($n) fits a field to exactly $n columns: padded with spaces when it
+    # fits, or cut with a trailing "…" when it does not, so a truncated name
+    # or needs-text reads as cut off rather than merely coincidentally short.
+    # $n can be <= 0 at a narrow terminal width (see $midw below); guard it
+    # explicitly rather than lean on the negative-slice/null-identity
+    # behavior a raw jq expression would otherwise fall into there.
+    def pad($n):
+      if $n <= 0 then ""
+      elif length > $n then
+        (if $n == 1 then "…" else .[0:($n - 1)] + "…" end)
+      else . + (" " * ($n - length))
+      end;
     def glyph:
       if .state == "blocked" then "!"
       elif .working then "●"

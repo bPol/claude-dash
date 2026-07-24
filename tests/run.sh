@@ -445,6 +445,23 @@ check "no frame line exceeds the terminal width" \
   "$(awk 'length > 100' <<<"$frame" | wc -l)" "0"
 rm -rf "$(dirname "$p")"
 
+# A name and a needs-text too long to fit their column must be cut with a
+# trailing ellipsis, not silently chopped -- and the terminal-width guarantee
+# must hold at every width, narrow ones included, where the mid-column
+# arithmetic ($w - 46) can go negative.
+p=$(producer_stub '[
+  {"kind":"interactive","pid":1,"name":"a very long session name that will definitely need truncating","cwd":"/home/u/x","status":"busy","working":true,"state":null,"needs":null,"idle_ms":120000,"job_id":null,"finished":false},
+  {"kind":"bg","pid":3,"name":"typo clarification","cwd":"/home/u/x","status":"idle","working":false,"state":"blocked","needs":"did you mean exit or edit, or something else entirely that runs well past any column width","idle_ms":360000,"job_id":"j","finished":false}]')
+for w in 40 60 100 200; do
+  frame=$(COLUMNS=$w CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash" --once)
+  check "no frame line exceeds $w columns" \
+    "$(awk -v w="$w" 'length > w' <<<"$frame" | wc -l)" "0"
+done
+frame=$(COLUMNS=60 CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash" --once)
+check "a truncated name ends in an ellipsis" \
+  "$(grep -c '…' <<<"$frame")" "2"
+rm -rf "$(dirname "$p")"
+
 p=$(producer_stub '[]')
 frame=$(COLUMNS=100 CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash" --once)
 check "empty board says so explicitly" "$(grep -c 'no sessions running' <<<"$frame")" "1"
