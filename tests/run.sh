@@ -271,4 +271,52 @@ rm -rf "$root"
 
 rm -rf "$stub_dir"
 
+printf '\nclaude-dash-badge\n'
+
+producer_stub() {   # producer_stub SESSIONS_JSON -> path to a stub producer
+  local d
+  d=$(mktemp -d "${TMPDIR:-/tmp}/claude-dash-prod.XXXXXX")
+  { printf '#!/usr/bin/env bash\ncat <<'"'"'JSON'"'"'\n'
+    jq -n --argjson s "$1" '{host:"testbox",generated_at:0,degraded:false,unreadable:0,sessions:$s}'
+    printf 'JSON\n'
+  } >"$d/producer"
+  chmod +x "$d/producer"
+  printf '%s' "$d/producer"
+}
+
+p=$(producer_stub '[
+  {"kind":"interactive","pid":1,"name":"api refactor","cwd":"/home/u/x","status":"busy","working":true,"state":null,"needs":null,"idle_ms":120000,"job_id":null,"finished":false},
+  {"kind":"interactive","pid":2,"name":"animation","cwd":"/home/u/x","status":"idle","working":false,"state":null,"needs":null,"idle_ms":600000,"job_id":null,"finished":false},
+  {"kind":"bg","pid":3,"name":"typo clarification","cwd":"/home/u/x","status":"idle","working":false,"state":"blocked","needs":"exit or edit?","idle_ms":360000,"job_id":"j","finished":false},
+  {"kind":"bg","pid":4,"name":"sales","cwd":"/home/u/x","status":"idle","working":false,"state":"done","needs":null,"idle_ms":950400000,"job_id":"k","finished":true}]')
+out=$(CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash-badge")
+check "badge counts are busy/blocked/idle over unfinished rows" \
+  "$(jq -r '.text' <<<"$out")" "1▸1▸1"
+check "blocked sets the alert class" "$(jq -r '.class' <<<"$out")" "alert"
+check "tooltip leads with the hostname" \
+  "$(jq -r '.tooltip | split("\n")[0]' <<<"$out")" "testbox"
+check "tooltip mentions the blocked agent" \
+  "$(jq -r '.tooltip | contains("typo clarification")' <<<"$out")" "true"
+rm -rf "$(dirname "$p")"
+
+p=$(producer_stub '[{"kind":"interactive","pid":1,"name":"n","cwd":"/x","status":"busy","working":true,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
+check "busy without blocked is the active class" \
+  "$(CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash-badge" | jq -r '.class')" "active"
+rm -rf "$(dirname "$p")"
+
+p=$(producer_stub '[{"kind":"interactive","pid":1,"name":"n","cwd":"/x","status":"shell","working":true,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
+check "a session in a shell command counts as busy, not idle" \
+  "$(CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash-badge" | jq -r '.text')" "1▸0▸0"
+rm -rf "$(dirname "$p")"
+
+p=$(producer_stub '[{"kind":"interactive","pid":1,"name":"n","cwd":"/x","status":"idle","working":false,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
+check "all idle is the quiet class" \
+  "$(CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash-badge" | jq -r '.class')" "quiet"
+rm -rf "$(dirname "$p")"
+
+out=$(CLAUDE_DASH_PRODUCER=/nonexistent/producer "$BIN/claude-dash-badge")
+check "producer failure yields the error class" "$(jq -r '.class' <<<"$out")" "error"
+check "producer failure still renders a glyph, never a blank" \
+  "$(jq -r '.text' <<<"$out")" "?"
+
 summary
