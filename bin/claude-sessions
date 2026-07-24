@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Emit every live Claude Code session on this machine as one JSON document.
+# The only component that knows Claude Code's on-disk layout.
+set -uo pipefail
+
+ROOT=${CLAUDE_DASH_ROOT:-$HOME/.claude}
+SESSIONS_DIR=$ROOT/sessions
+HOST=${CLAUDE_DASH_HOST:-$(uname -n)}
+NOW=$(date +%s%3N)
+
+# proc_start PID — field 22 of /proc/PID/stat, non-zero exit if the pid is gone.
+# NOTE: `$(</proc/N/stat 2>/dev/null)` returns an EMPTY STRING successfully --
+# the redirection defeats bash's special read-a-file form. Check readability
+# first, then use the bare form, or every session looks dead.
+proc_start() {
+  local raw rest fields
+  [[ -r /proc/$1/stat ]] || return 1
+  raw=$(</proc/"$1"/stat) 2>/dev/null || return 1
+  rest=${raw#*') '}          # drop "PID (comm) "; comm may contain spaces
+  read -ra fields <<<"$rest"
+  printf '%s' "${fields[19]}"
+}
+
+# emit DEGRADED UNREADABLE SESSIONS_JSON
+emit() {
+  jq -n --arg host "$HOST" --argjson now "$NOW" \
+        --argjson degraded "$1" --argjson unreadable "$2" --argjson sessions "$3" \
+    '{host: $host, generated_at: $now, degraded: $degraded,
+      unreadable: $unreadable, sessions: $sessions}'
+}
+
+live=()
+unreadable=0
+
+if [[ -d $SESSIONS_DIR ]]; then
+  shopt -s nullglob
+  for file in "$SESSIONS_DIR"/*.json; do
+    content=$(<"$file") 2>/dev/null || { unreadable=$((unreadable + 1)); continue; }
+    if [[ ! $content =~ \"pid\":([0-9]+) ]]; then
+      unreadable=$((unreadable + 1)); continue
+    fi
+    pid=${BASH_REMATCH[1]}
+    if [[ ! $content =~ \"procStart\":\"([0-9]+)\" ]]; then
+      unreadable=$((unreadable + 1)); continue
+    fi
+    recorded=${BASH_REMATCH[1]}
+    current=$(proc_start "$pid") || continue   # process is gone
+    [[ $current == "$recorded" ]] || continue  # pid was reused
+    live+=("$file")
+  done
+  shopt -u nullglob
+fi
+
+sessions='[]'
+if ((${#live[@]})); then
+  sessions=$(jq -c -n --argjson now "$NOW" '
+    # Session names and agent questions are LLM-authored free text. They are
+    # rendered into a Pango-markup tooltip and a terminal frame, so strip
+    # control characters and escape markup once, here, for every consumer.
+    def clean:
+      if . == null then null
+      else gsub("[[:cntrl:]]"; "")
+           | gsub("&"; "&amp;") | gsub("<"; "&lt;") | gsub(">"; "&gt;")
+      end;
+
+    [ inputs
+      | { kind:    (if .kind == "bg" then "bg" else "interactive" end),
+          pid:     .pid,
+          name:    ((.name // "(unnamed)") | clean),
+          cwd:     (.cwd // ""),
+          status:  (.status // "idle"),
+          working: ((.status // "idle") | . == "busy" or . == "shell"),
+          state:   null,
+          needs:   null,
+          idle_ms: ($now - (.statusUpdatedAt // .updatedAt // $now)),
+          job_id:  (.jobId // null) } ]' "${live[@]}" 2>/dev/null) || sessions='[]'
+fi
+
+emit false "$unreadable" "$sessions"
