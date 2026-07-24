@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# Read-only board of local Claude Code sessions. `--once` prints one frame.
+set -uo pipefail
+
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PRODUCER=${CLAUDE_DASH_PRODUCER:-$HERE/claude-sessions}
+LIVE_INTERVAL=${CLAUDE_DASH_INTERVAL:-2}
+IDLE_INTERVAL=${CLAUDE_DASH_IDLE_INTERVAL:-60}
+INTERVAL=$LIVE_INTERVAL
+PIDFILE=${CLAUDE_DASH_PIDFILE:-${XDG_RUNTIME_DIR:-/tmp}/claude-dash.pid}
+
+term_width() {
+  if [[ -n ${COLUMNS:-} ]] && ((COLUMNS > 0)); then printf '%s' "$COLUMNS"; return; fi
+  tput cols 2>/dev/null || printf '80'
+}
+
+# frame WIDTH — render the current state as plain text on stdout.
+frame() {
+  local width=$1 data
+  data=$("$PRODUCER" 2>/dev/null) || data=''
+  if [[ -z $data ]]; then
+    printf ' claude sessions\n\n ⚠ no data — the producer failed\n'
+    return
+  fi
+  jq -r --argjson w "$width" '
+    def age:
+      if . == null then "—"
+      elif . < 60000 then "\((. / 1000 | floor))s"
+      elif . < 3600000 then "\((. / 60000 | floor))m"
+      elif . < 86400000 then "\((. / 3600000 | floor))h"
+      else "\((. / 86400000 | floor))d" end;
+    def pad($n): (.[0:$n] | . + (" " * ($n - length)));
+    def glyph:
+      if .state == "blocked" then "!"
+      elif .working then "●"
+      else "○" end;
+    # named status_label, not label: jq 1.7 reserves `label` as a keyword
+    # (for `label $out | ... break $out`), so `def label:` is a syntax error.
+    def status_label: (.state // .status);
+    def row($midw):
+      "  \(glyph) \(status_label | pad(8)) \(.name | pad(24)) " +
+      "\(((.needs // .cwd) | pad($midw))) \(.idle_ms | age)";
+
+    ($w - 46) as $midw
+    | (.sessions | map(select(.finished | not))) as $live
+    | (.sessions | map(select(.finished)))       as $done
+    | ($live | map(select(.state == "blocked")) | length) as $nblocked
+    | ($live | map(select(.working))            | length) as $nbusy
+    | ($live | map(select((.working | not) and .state != "blocked")) | length) as $nidle
+    | ($live | map(select(.kind == "interactive"))) as $inter
+    | ($live | map(select(.kind == "bg")))          as $bg
+    | [ " claude sessions · \(.host)" +
+        (if .degraded then "   ⚠ degraded (CLI fallback)" else "" end) +
+        (if .unreadable > 0 then "   ⚠ \(.unreadable) unreadable" else "" end),
+        "   \($nbusy) busy · \($nblocked) blocked · \($nidle) idle",
+        "" ]
+      + (if ($inter | length) > 0
+         then [" INTERACTIVE"] + ($inter | map(row($midw))) + [""] else [] end)
+      + (if ($bg | length) > 0
+         then [" BACKGROUND"]  + ($bg    | map(row($midw))) + [""] else [] end)
+      + (if ($live | length) == 0 then ["   no sessions running", ""] else [] end)
+      + (if ($done | length) > 0
+         then ["   … \($done | length) finished (\($done | map(.name) | join(", ")))"]
+         else [] end)
+      + ["", "   q close"]
+      | .[]
+      | .[0:$w]' <<<"$data" 2>/dev/null \
+    || printf ' claude sessions\n\n ⚠ could not parse producer output\n'
+}
+
+if [[ ${1:-} == "--once" ]]; then
+  frame "$(term_width)"
+  exit 0
+fi
+
+# The pidfile is how the toggle finds us. Matching on the command line instead
+# breaks the moment the scripts are installed outside a directory named *bin.
+printf '%s' "$$" >"$PIDFILE" 2>/dev/null
+
+cleanup() {
+  rm -f "$PIDFILE" 2>/dev/null
+  printf '\e[?25h\e[?1049l'   # cursor back, leave the alternate screen
+  exit 0
+}
+trap cleanup EXIT INT TERM
+trap 'WIDTH=$(term_width)' WINCH
+# The toggle signals us when the window is hidden or shown, so a board parked
+# in the scratchpad stops burning a full refresh on frames nobody can see.
+# A missed signal is harmless: the board keeps refreshing at its current rate.
+trap 'INTERVAL=$IDLE_INTERVAL' USR1
+trap 'INTERVAL=$LIVE_INTERVAL; ticks=0' USR2   # ticks=0 forces an immediate repaint
+
+printf '\e[?1049h\e[?25l'      # alternate screen, hide cursor
+WIDTH=$(term_width)
+
+# Wait in half-second ticks rather than one long `read -t $INTERVAL`. Verified
+# on bash 5.2.37: a signal handler runs immediately but `read -t` then resumes
+# with its ORIGINAL timeout, so a board napping at 60s would keep showing a
+# stale frame for up to a minute after you unhide it. Short ticks make an
+# interval change take effect within 0.5s. A tick that only times out costs a
+# syscall return -- no fork, no jq, no repaint.
+#
+# `read` only blocks on a terminal. With stdin redirected it returns instantly,
+# so the non-interactive path sleeps instead and drops key handling.
+# Intervals are counted in half-second ticks so the arithmetic stays integer.
+TICK=0.5
+TICKS_PER_SECOND=2
+ticks=0
+while true; do
+  if (( ticks <= 0 )); then
+    printf '\e[H%s\e[J' "$(frame "$WIDTH")"
+    ticks=$(( INTERVAL * TICKS_PER_SECOND ))
+  fi
+  if [[ -t 0 ]]; then
+    read -rsn1 -t "$TICK" key && [[ $key == q || $key == $'\e' ]] && break
+  else
+    sleep "$TICK"
+  fi
+  ticks=$(( ticks - 1 ))
+done

@@ -319,4 +319,53 @@ check "producer failure yields the error class" "$(jq -r '.class' <<<"$out")" "e
 check "producer failure still renders a glyph, never a blank" \
   "$(jq -r '.text' <<<"$out")" "?"
 
+printf '\nclaude-dash board\n'
+
+p=$(producer_stub '[
+  {"kind":"interactive","pid":1,"name":"api refactor","cwd":"/home/u/src/api","status":"busy","working":true,"state":null,"needs":null,"idle_ms":120000,"job_id":null,"finished":false},
+  {"kind":"bg","pid":3,"name":"typo clarification","cwd":"/home/u/src/api","status":"idle","working":false,"state":"blocked","needs":"did you mean exit or edit?","idle_ms":360000,"job_id":"j","finished":false},
+  {"kind":"bg","pid":4,"name":"sales","cwd":"/home/u/src/ops","status":"idle","working":false,"state":"done","needs":null,"idle_ms":950400000,"job_id":"k","finished":true}]')
+frame=$(COLUMNS=100 CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash" --once)
+
+check "header carries the hostname" \
+  "$(grep -c 'claude sessions · testbox' <<<"$frame")" "1"
+check "interactive section is present" "$(grep -c '^ INTERACTIVE' <<<"$frame")" "1"
+check "background section is present" "$(grep -c '^ BACKGROUND' <<<"$frame")" "1"
+check "live rows are shown" "$(grep -c 'api refactor' <<<"$frame")" "1"
+check "blocked row shows what it needs" \
+  "$(grep -c 'did you mean exit or edit?' <<<"$frame")" "1"
+check "finished agent is collapsed, not listed as a row" \
+  "$(grep -c '1 finished' <<<"$frame")" "1"
+check "ages are humanised" "$(grep -c '2m' <<<"$frame")" "1"
+check "no frame line exceeds the terminal width" \
+  "$(awk 'length > 100' <<<"$frame" | wc -l)" "0"
+rm -rf "$(dirname "$p")"
+
+p=$(producer_stub '[]')
+frame=$(COLUMNS=100 CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash" --once)
+check "empty board says so explicitly" "$(grep -c 'no sessions running' <<<"$frame")" "1"
+rm -rf "$(dirname "$p")"
+
+d=$(mktemp -d "${TMPDIR:-/tmp}/claude-dash-prod.XXXXXX")
+{ printf '#!/usr/bin/env bash\ncat <<'"'"'JSON'"'"'\n'
+  jq -n '{host:"testbox",generated_at:0,degraded:true,unreadable:2,sessions:[]}'
+  printf 'JSON\n'; } >"$d/producer"
+chmod +x "$d/producer"
+frame=$(COLUMNS=100 CLAUDE_DASH_PRODUCER=$d/producer "$BIN/claude-dash" --once)
+check "degraded mode is announced in the header" \
+  "$(grep -c 'degraded (CLI fallback)' <<<"$frame")" "1"
+check "unreadable files are announced" "$(grep -c '2 unreadable' <<<"$frame")" "1"
+rm -rf "$d"
+
+# Without a terminal on stdin, `read -t` returns instantly. If the loop used it
+# anyway it would spin as fast as the CPU allows. Run it headless for 1s with a
+# 0.2s interval: a sleeping loop paints ~5 frames, a spinning one paints
+# thousands. The bound is deliberately loose so a slow machine does not flake.
+p=$(producer_stub '[]')
+frames=$(COLUMNS=100 CLAUDE_DASH_PRODUCER=$p CLAUDE_DASH_INTERVAL=1 \
+         timeout 2 "$BIN/claude-dash" </dev/null 2>/dev/null | tr -cd 'q' | wc -c)
+check "non-tty loop sleeps instead of spinning" \
+  "$([[ $frames -lt 50 ]] && echo bounded || echo spinning)" "bounded"
+rm -rf "$(dirname "$p")"
+
 summary
