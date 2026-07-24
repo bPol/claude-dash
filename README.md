@@ -34,6 +34,11 @@ waybar and CSS blocks to paste. Then `swaymsg reload`.
 | `CLAUDE_DASH_IDLE_INTERVAL` | `60` | Board refresh seconds while hidden in the scratchpad. |
 | `CLAUDE_DASH_CLI` | `claude` | Binary used for the degraded-mode fallback. |
 | `CLAUDE_DASH_ARBITRATE_EVERY` | `60` | Minimum seconds between fallback cross-checks. |
+| `CLAUDE_DASH_PIDFILE` | `$XDG_RUNTIME_DIR/claude-dash.pid` | How the toggle finds the running board to signal it. The board and the toggle must agree on this, or hiding the board stops slowing it down. |
+| `CLAUDE_DASH_STAMP` | `$XDG_RUNTIME_DIR/claude-dash-arbitrated` | Rate-limit stamp for the fallback cross-check. |
+| `CLAUDE_DASH_BOARD` | `claude-dash` | Board command the toggle launches. |
+| `CLAUDE_DASH_HOST` | `uname -n` | Overrides the hostname shown in the header and tooltip. |
+| `CLAUDE_DASH_BIN_DIR` | `~/.local/bin` | Where `install.sh` symlinks the scripts. |
 
 ## Tests
 
