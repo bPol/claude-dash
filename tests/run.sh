@@ -382,7 +382,7 @@ job_a=$!
 sleep 0.3  # let it write the pidfile
 
 pid_a=$(cat "$test_pidfile" 2>/dev/null || printf '')
-[[ -n $pid_a ]] && check "first board wrote to pidfile" "yes" "yes" || check "first board wrote to pidfile" "no" "yes"
+check "first board wrote to pidfile" "$([[ -n $pid_a ]] && printf yes || printf no)" "yes"
 
 # Start second board in background, let it overwrite pidfile
 CLAUDE_DASH_PIDFILE="$test_pidfile" CLAUDE_DASH_PRODUCER=$p timeout 10 "$BIN/claude-dash" </dev/null >/dev/null 2>&1 &
