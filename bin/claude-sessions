@@ -154,6 +154,24 @@ def order:
            (if .kind == "interactive" then 0 else 1 end),
            rank,
            (.idle_ms // 0) );
+# job_row($id; $mt) -- a standalone row built from jobs/<id>/state.json alone,
+# for a background agent whose process has already exited: no session file
+# exists for it at all, so `record` above never sees it. $mt is the
+# state.json mtime in epoch ms, used when .updatedAt is not itself a numeric
+# epoch-ms timestamp (in practice it is an ISO-8601 string).
+def job_row($id; $mt):
+  . as $j
+  | { kind:    "bg",
+      pid:     null,
+      name:    (($j.name // $id) | clean),
+      cwd:     ($j.cwd // ""),
+      status:  ($j.tempo // $j.state // "idle"),
+      working: (($j.state // "") as $st | ($st != "blocked" and $st != "done")),
+      state:   ($j.state // null),
+      needs:   (($j.needs // null) | clean),
+      idle_ms: ($now - (if ($j.updatedAt | type) == "number" then $j.updatedAt else $mt end)),
+      job_id:  $id }
+  | . + { finished: (.state == "done" or .state == "error") };
 '
 
 sessions='[]'
@@ -181,6 +199,60 @@ if ((${#live[@]})); then
   fi
 fi
 
+# jobs/*/state.json is a row source in its own right, not just the lookup
+# `jobs_map` feeds into `record` above: a background agent whose process has
+# already exited -- including one that is blocked and waiting on the user --
+# leaves a job directory with NO session file at all, so it never appears in
+# `sessions` above no matter what. `mtimes` is a single `stat` call over every
+# state.json file (not one process per job dir), feeding job_row's idle_ms
+# fallback for the common case where .updatedAt is an ISO-8601 string rather
+# than a numeric epoch timestamp.
+job_rows='[]'
+if compgen -G "$JOBS_DIR/*/state.json" >/dev/null 2>&1; then
+  mtimes=$(stat -c $'%n\t%Y' "$JOBS_DIR"/*/state.json 2>/dev/null)
+  if job_rows=$(jq -c -n --argjson now "$NOW" --arg mtimes "$mtimes" \
+      "$JQ_RECORD_DEF"'
+        ( $mtimes | split("\n") | map(select(length > 0) | split("\t"))
+            | map({ key: (.[0] | split("/")[-2]), value: ((.[1] | tonumber) * 1000) })
+            | from_entries ) as $mt
+        | [ inputs | (input_filename | split("/")[-2]) as $id
+            | job_row($id; ($mt[$id] // $now)) ]
+      ' "$JOBS_DIR"/*/state.json 2>/dev/null); then
+    : # common case: every job file parsed in one batched call
+  else
+    # Same rare-corruption fallback as the session batch above: one bad job
+    # file must not sink every other job's row.
+    job_rows='[]'
+    for jf in "$JOBS_DIR"/*/state.json; do
+      id=${jf%/state.json}; id=${id##*/}
+      mt=$(stat -c %Y "$jf" 2>/dev/null) || mt=0
+      mt=$((mt * 1000))
+      if row=$(jq -c --argjson now "$NOW" --argjson mt "$mt" --arg id "$id" \
+          "$JQ_RECORD_DEF"'job_row($id; $mt)' "$jf" 2>/dev/null); then
+        job_rows=$(jq -c --argjson r "$row" '. + [$r]' <<<"$job_rows")
+      else
+        unreadable=$((unreadable + 1))
+      fi
+    done
+  fi
+fi
+
+# Merge: a job id already covered by a live session row (session-derived rows
+# carry pid, cwd and real timestamps) keeps that row and gets no duplicate;
+# every other job row is appended. `order` re-runs over the combined set so
+# blocked-first/finished-last placement is identical whether a row came from
+# a session file, a job file, or (for a covered id) both.
+if [[ $job_rows != '[]' ]]; then
+  if merged=$(jq -c -n --argjson s "$sessions" --argjson j "$job_rows" \
+      "$JQ_RECORD_DEF"'
+        ( [ $s[].job_id | select(. != null) ] ) as $covered
+        | ($j | map(select(.job_id as $id | ($covered | index($id)) | not))) as $orphans
+        | ($s + $orphans) | order
+      ' 2>/dev/null); then
+    sessions=$merged
+  fi
+fi
+
 # Path 1: no registry at all. Always degraded, but the CLI cross-check is
 # rate-limited exactly like Path 2 -- same ~0.5s/~300MB cost, and this branch
 # is hit on every poll for a fresh install or a misconfigured
@@ -194,7 +266,7 @@ if [[ ! -d $SESSIONS_DIR ]]; then
       exit 0
     fi
   fi
-  emit true "$unreadable" '[]'
+  emit true "$unreadable" "$sessions"
   exit 0
 fi
 

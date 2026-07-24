@@ -158,6 +158,61 @@ check "status shell is still reported literally" \
   "$(jq -r '.sessions[0].status' <<<"$out")" "shell"
 rm -rf "$root"
 
+printf '\nclaude-sessions: orphan job rows (background process already exited)\n'
+
+# Shape (b): the process has exited, so there is no sessions/<pid>.json at
+# all -- only jobs/<id>/state.json survives. This is the case the whole tool
+# exists for: an agent blocked and waiting on the user that would otherwise
+# be completely invisible.
+root=$(new_root)
+mk_orphan_job "$root" j-orphan-blocked blocked "typo clarification" \
+  "/home/u/projects/demo" "did you mean \`exit\` or \`edit\`?"
+out=$(CLAUDE_DASH_ROOT=$root "$BIN/claude-sessions")
+check "orphan blocked job appears as a row" \
+  "$(jq -r '.sessions | length' <<<"$out")" "1"
+check "orphan blocked row has no pid" \
+  "$(jq -r '.sessions[0].pid' <<<"$out")" "null"
+check "orphan blocked row carries its name" \
+  "$(jq -r '.sessions[0].name' <<<"$out")" "typo clarification"
+check "orphan blocked row carries its cwd" \
+  "$(jq -r '.sessions[0].cwd' <<<"$out")" "/home/u/projects/demo"
+check "orphan blocked row state is blocked" \
+  "$(jq -r '.sessions[0].state' <<<"$out")" "blocked"
+# shellcheck disable=SC2016 # single-quoted on purpose: literal backticks, not command substitution
+check "orphan blocked row carries its needs text" \
+  "$(jq -r '.sessions[0].needs' <<<"$out")" 'did you mean `exit` or `edit`?'
+check "orphan blocked row is not finished" \
+  "$(jq -r '.sessions[0].finished' <<<"$out")" "false"
+check "orphan blocked row is not working" \
+  "$(jq -r '.sessions[0].working' <<<"$out")" "false"
+check "orphan blocked job_id is the job directory name" \
+  "$(jq -r '.sessions[0].job_id' <<<"$out")" "j-orphan-blocked"
+rm -rf "$root"
+
+root=$(new_root)
+mk_orphan_job "$root" j-orphan-done done "sales" "/home/u/projects/other"
+out=$(CLAUDE_DASH_ROOT=$root "$BIN/claude-sessions")
+check "orphan done job appears as a row" \
+  "$(jq -r '.sessions | length' <<<"$out")" "1"
+check "orphan done job is marked finished" \
+  "$(jq -r '.sessions[0].finished' <<<"$out")" "true"
+check "orphan done job is not working" \
+  "$(jq -r '.sessions[0].working' <<<"$out")" "false"
+rm -rf "$root"
+
+# The same job id has both a live session file AND a job directory (the
+# common in-progress case): the session-derived row wins and no duplicate
+# appears.
+root=$(new_root)
+mk_session "$root" "$$" bg "typo clarification" idle 5000 j-shared
+mk_job "$root" j-shared blocked "answer me"
+out=$(CLAUDE_DASH_ROOT=$root "$BIN/claude-sessions")
+check "job covered by a live session yields exactly one row" \
+  "$(jq -r '.sessions | length' <<<"$out")" "1"
+check "the surviving row is the session-derived one (has a pid)" \
+  "$(jq -r '.sessions[0].pid' <<<"$out")" "$$"
+rm -rf "$root"
+
 printf '\nclaude-sessions: degraded mode\n'
 
 # A stub standing in for `claude agents --json`.

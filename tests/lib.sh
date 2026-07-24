@@ -50,6 +50,24 @@ mk_job() {
     >"$root/jobs/$id/state.json"
 }
 
+# mk_orphan_job ROOT JOB_ID STATE NAME CWD [NEEDS] [UPDATED_AT_MS]
+# A job directory with NO corresponding session file: the shape left behind
+# when a background agent's process has already exited, including one that
+# is blocked and waiting on the user. UPDATED_AT_MS, when given, is written
+# as a numeric epoch-ms .updatedAt so idle_ms is deterministic instead of
+# depending on the state.json file's mtime.
+mk_orphan_job() {
+  local root=$1 id=$2 state=$3 name=$4 cwd=$5 needs=${6:-} updated=${7:-}
+  local needs_json=null name_json cwd_json updated_field=''
+  mkdir -p "$root/jobs/$id"
+  [[ -n $needs ]] && needs_json=$(printf '%s' "$needs" | jq -Rs .)
+  name_json=$(printf '%s' "$name" | jq -Rs .)
+  cwd_json=$(printf '%s' "$cwd" | jq -Rs .)
+  [[ -n $updated ]] && updated_field=",\"updatedAt\":$updated"
+  printf '%s\n' "{\"state\":\"$state\",\"detail\":\"d\",\"tempo\":\"$state\",\"needs\":$needs_json,\"name\":$name_json,\"cwd\":$cwd_json$updated_field}" \
+    >"$root/jobs/$id/state.json"
+}
+
 # check DESCRIPTION ACTUAL EXPECTED
 check() {
   TESTS_RUN=$((TESTS_RUN + 1))
