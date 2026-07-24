@@ -36,20 +36,19 @@ arbitration_due() {
 }
 
 # cli_sessions — normalized array from `claude agents --json`; non-zero on failure.
+# `name` is agent-authored free text same as the registry path, so it goes
+# through the same `clean` filter (shared via $JQ_CLEAN_DEF, set below) before
+# it can reach the Pango-markup tooltip.
 cli_sessions() {
   local raw
   command -v "$CLI" >/dev/null 2>&1 || return 1
   raw=$("$CLI" agents --json 2>/dev/null) || return 1
   [[ -n $raw ]] || return 1
-  jq -c '
-    def rank:
-      if .state == "blocked" then 0
-      elif .working then 1
-      else 2 end;
+  jq -c "$JQ_CLEAN_DEF"'
     [ .[]
       | { kind:    (if .kind == "interactive" then "interactive" else "bg" end),
           pid:     .pid,
-          name:    (.name // "(unnamed)"),
+          name:    ((.name // "(unnamed)") | clean),
           cwd:     (.cwd // ""),
           status:  (.status // "idle"),
           working: ((.status // "idle") | . == "busy" or . == "shell"),
@@ -107,22 +106,31 @@ fi
 
 # Session names and agent questions are LLM-authored free text. They are
 # rendered into a Pango-markup tooltip and a terminal frame, so strip
-# control characters and escape markup once, here, for every consumer.
-# Shared between the batch and per-file jq programs below so both stay in
-# sync; `record` reads $now from --argjson, bound in both invocations.
+# control characters and escape markup once, here, for every consumer --
+# including cli_sessions()'s CLI-fallback path above, which sources this too.
+# `shell` means the session is running a command, so it counts as working.
+# Derived once here; no consumer re-derives it from .status.
 # shellcheck disable=SC2016 # single-quoted on purpose: these are jq $vars, not bash's
-JQ_RECORD_DEF='
+JQ_CLEAN_DEF='
 def clean:
   if . == null then null
   else gsub("[[:cntrl:]]"; "")
        | gsub("&"; "&amp;") | gsub("<"; "&lt;") | gsub(">"; "&gt;")
   end;
-# `shell` means the session is running a command, so it counts as working.
-# Derived once here; no consumer re-derives it from .status.
 def rank:
   if .state == "blocked" then 0
   elif .working then 1
   else 2 end;
+'
+# Shared between the batch and per-file jq programs below so both stay in
+# sync; `record` reads $now from --argjson, bound in both invocations.
+# record/order (below) depend on $jobs/$now bound via --argjson, unlike
+# JQ_CLEAN_DEF, so cli_sessions() -- which has neither -- only pulls in the
+# clean/rank half; the full registry-merge shape would need those bindings
+# for no benefit (idle_ms and job/needs merging don't apply to the CLI path).
+# shellcheck disable=SC2016 # the rest of this string is single-quoted on
+# purpose (jq $vars, not bash's); only the leading "$JQ_CLEAN_DEF" expands.
+JQ_RECORD_DEF="$JQ_CLEAN_DEF"'
 def record:
   . as $s
   | (if $s.jobId then ($jobs[$s.jobId] // {}) else {} end) as $j
@@ -173,11 +181,18 @@ if ((${#live[@]})); then
   fi
 fi
 
-# Path 1: no registry at all.
+# Path 1: no registry at all. Always degraded, but the CLI cross-check is
+# rate-limited exactly like Path 2 -- same ~0.5s/~300MB cost, and this branch
+# is hit on every poll for a fresh install or a misconfigured
+# CLAUDE_DASH_ROOT, so an unconditional call would shell out forever.
 if [[ ! -d $SESSIONS_DIR ]]; then
-  if fallback=$(cli_sessions) && [[ -n $fallback ]]; then
-    emit true "$unreadable" "$fallback"
-    exit 0
+  if arbitration_due; then
+    mkdir -p "$(dirname "$STAMP")" 2>/dev/null
+    : >"$STAMP"
+    if fallback=$(cli_sessions) && [[ -n $fallback ]]; then
+      emit true "$unreadable" "$fallback"
+      exit 0
+    fi
   fi
   emit true "$unreadable" '[]'
   exit 0

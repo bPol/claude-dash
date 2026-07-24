@@ -208,11 +208,65 @@ check "genuine zero has no sessions" "$(jq -r '.sessions | length' <<<"$out")" "
 rm -rf "$root"
 
 root=$(new_root)                # CLI itself broken, registry gone
+rm -rf "$root/sessions"
 out=$(CLAUDE_DASH_ROOT=$root CLAUDE_DASH_CLI=/nonexistent/claude \
       CLAUDE_DASH_STAMP=$root/stamp "$BIN/claude-sessions")
-rm -rf "$root/sessions"
 check "both sources failing still emits valid JSON" \
   "$(jq -r '.sessions | length' <<<"$out")" "0"
+rm -rf "$root"
+
+# A counting stub: records one line per invocation, so the rate limit on
+# Path 1 (registry entirely absent) can be asserted by invocation count, not
+# just by output shape.
+cat >"$stub_dir/claude-counting" <<'STUB'
+#!/usr/bin/env bash
+printf 'call\n' >>"$COUNT_FILE"
+[[ "$1" == "agents" ]] || exit 1
+cat <<'JSON'
+[{"pid":490203,"cwd":"/home/u/projects/demo","kind":"interactive",
+  "startedAt":1784794917430,"sessionId":"z","name":"counted","status":"busy"}]
+JSON
+STUB
+chmod +x "$stub_dir/claude-counting"
+
+root=$(new_root)
+rm -rf "$root/sessions"          # registry gone entirely, before either call
+count_file=$root/call-count
+: >"$count_file"
+out=$(CLAUDE_DASH_ROOT=$root CLAUDE_DASH_CLI=$stub_dir/claude-counting \
+      CLAUDE_DASH_STAMP=$root/stamp COUNT_FILE=$count_file "$BIN/claude-sessions")
+check "missing registry invokes the CLI once and stays degraded" \
+  "$(jq -r '.degraded' <<<"$out")" "true"
+check "missing registry: first call invokes the CLI exactly once" \
+  "$(wc -l <"$count_file" | tr -d ' ')" "1"
+out=$(CLAUDE_DASH_ROOT=$root CLAUDE_DASH_CLI=$stub_dir/claude-counting \
+      CLAUDE_DASH_STAMP=$root/stamp COUNT_FILE=$count_file "$BIN/claude-sessions")
+check "missing registry: second call within the rate-limit window does not invoke the CLI again" \
+  "$(wc -l <"$count_file" | tr -d ' ')" "1"
+check "missing registry: rate-limited second call still reports degraded" \
+  "$(jq -r '.degraded' <<<"$out")" "true"
+check "missing registry: rate-limited second call has no cached sessions" \
+  "$(jq -r '.sessions | length' <<<"$out")" "0"
+rm -rf "$root"
+
+# A stub returning agent-authored text with markup and a control character
+# (BEL), mirroring the reviewer's `<b>evil&bad</b>` example: cli_sessions()
+# must sanitise it the same way the registry path does.
+cat >"$stub_dir/claude-unsafe" <<'STUB'
+#!/usr/bin/env bash
+[[ "$1" == "agents" ]] || exit 1
+name=$'<b>evil&bad\a</b>'
+printf '[{"pid":490204,"cwd":"/home/u/projects/demo","kind":"interactive","startedAt":1784794917430,"sessionId":"w","name":%s,"status":"busy"}]\n' \
+  "$(printf '%s' "$name" | jq -Rs .)"
+STUB
+chmod +x "$stub_dir/claude-unsafe"
+
+root=$(new_root)
+rm -rf "$root/sessions"          # registry gone entirely
+out=$(CLAUDE_DASH_ROOT=$root CLAUDE_DASH_CLI=$stub_dir/claude-unsafe \
+      CLAUDE_DASH_STAMP=$root/stamp "$BIN/claude-sessions")
+check "CLI-supplied name with markup and a control char is sanitised" \
+  "$(jq -r '.sessions[0].name' <<<"$out")" '&lt;b&gt;evil&amp;bad&lt;/b&gt;'
 rm -rf "$root"
 
 rm -rf "$stub_dir"
