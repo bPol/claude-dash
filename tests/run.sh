@@ -409,6 +409,20 @@ check "unreadable alongside real sessions is still surfaced in the tooltip" \
   "$(jq -r '.tooltip | contains("1 unreadable")' <<<"$out")" "true"
 rm -rf "$d"
 
+# A row that is both working and blocked (reachable now that job-derived rows
+# exist) must be counted once, as blocked -- not once in each bucket, which
+# would break busy+blocked+idle == unfinished sessions.
+p=$(producer_stub '[
+  {"kind":"bg","pid":1,"name":"working and blocked","cwd":"/x","status":"busy","working":true,"state":"blocked","needs":"n","idle_ms":1000,"job_id":"j1","finished":false},
+  {"kind":"interactive","pid":2,"name":"plain busy","cwd":"/x","status":"busy","working":true,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false},
+  {"kind":"interactive","pid":3,"name":"plain idle","cwd":"/x","status":"idle","working":false,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
+out=$(CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash-badge")
+check "a row that is both working and blocked counts once, as blocked" \
+  "$(jq -r '.text' <<<"$out")" "1▸1▸1"
+check "busy + blocked + idle sums to the unfinished session count" \
+  "$(jq -r '.text | split("▸") | map(tonumber) | add' <<<"$out")" "3"
+rm -rf "$(dirname "$p")"
+
 printf '\nclaude-dash board\n'
 
 p=$(producer_stub '[
@@ -446,6 +460,18 @@ check "degraded mode is announced in the header" \
   "$(grep -c 'degraded (CLI fallback)' <<<"$frame")" "1"
 check "unreadable files are announced" "$(grep -c '2 unreadable' <<<"$frame")" "1"
 rm -rf "$d"
+
+# Same mutual-exclusion requirement as the badge: a row both working and
+# blocked must count once (as blocked), so busy+blocked+idle == live rows.
+p=$(producer_stub '[
+  {"kind":"bg","pid":1,"name":"working and blocked","cwd":"/x","status":"busy","working":true,"state":"blocked","needs":"n","idle_ms":1000,"job_id":"j1","finished":false},
+  {"kind":"interactive","pid":2,"name":"plain busy","cwd":"/x","status":"busy","working":true,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false},
+  {"kind":"interactive","pid":3,"name":"plain idle","cwd":"/x","status":"idle","working":false,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
+frame=$(COLUMNS=100 CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash" --once)
+check "board's busy/blocked/idle counts sum to the live session count" \
+  "$(grep -oE '[0-9]+ busy · [0-9]+ blocked · [0-9]+ idle' <<<"$frame" \
+     | grep -oE '[0-9]+' | awk '{s+=$1} END{print s+0}')" "3"
+rm -rf "$(dirname "$p")"
 
 # Without a terminal on stdin, `read -t` returns instantly. If the loop used it
 # anyway it would spin as fast as the CPU allows. Run it headless for 1s with a

@@ -45,7 +45,7 @@ frame() {
     | (.sessions | map(select(.finished | not))) as $live
     | (.sessions | map(select(.finished)))       as $done
     | ($live | map(select(.state == "blocked")) | length) as $nblocked
-    | ($live | map(select(.working))            | length) as $nbusy
+    | ($live | map(select(.working and .state != "blocked")) | length) as $nbusy
     | ($live | map(select((.working | not) and .state != "blocked")) | length) as $nidle
     | ($live | map(select(.kind == "interactive"))) as $inter
     | ($live | map(select(.kind == "bg")))          as $bg

@@ -23,7 +23,7 @@ jq -c -r '
 
   (.sessions | map(select(.finished | not))) as $live
   | ($live | map(select(.state == "blocked")) | length) as $blocked
-  | ($live | map(select(.working))            | length) as $busy
+  | ($live | map(select(.working and .state != "blocked")) | length) as $busy
   | ($live | map(select((.working | not) and .state != "blocked")) | length) as $idle
   | ((.sessions | map(select(.finished)) | length)) as $done
   | ((.sessions | length) == 0 and .unreadable > 0) as $blind
