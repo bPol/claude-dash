@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# waybar custom module: one line of JSON summarising local Claude Code sessions.
+set -uo pipefail
+
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PRODUCER=${CLAUDE_DASH_PRODUCER:-$HERE/claude-sessions}
+
+fail() {
+  printf '{"text":"?","tooltip":%s,"class":"error"}\n' "$(printf '%s' "$1" | jq -Rs .)"
+  exit 0
+}
+
+data=$("$PRODUCER" 2>/dev/null) || fail "claude-dash: producer failed"
+[[ -n $data ]] || fail "claude-dash: producer returned nothing"
+
+jq -c -r '
+  def age:
+    if . == null then "—"
+    elif . < 60000 then "\((. / 1000 | floor))s"
+    elif . < 3600000 then "\((. / 60000 | floor))m"
+    elif . < 86400000 then "\((. / 3600000 | floor))h"
+    else "\((. / 86400000 | floor))d" end;
+
+  (.sessions | map(select(.finished | not))) as $live
+  | ($live | map(select(.state == "blocked")) | length) as $blocked
+  | ($live | map(select(.working and .state != "blocked")) | length) as $busy
+  | ($live | map(select((.working | not) and .state != "blocked")) | length) as $idle
+  | ((.sessions | map(select(.finished)) | length)) as $done
+  | ((.sessions | length) == 0 and .unreadable > 0) as $blind
+  | {
+      text: (if $blind then "?" else "\($busy)▸\($blocked)▸\($idle)" end),
+      class: (if $blind then "error"
+              elif $blocked > 0 then "alert"
+              elif $busy > 0 then "active"
+              else "quiet" end),
+      tooltip: ([ .host + (if .degraded then "  ⚠ degraded (CLI fallback)" else "" end)
+                        + (if .unreadable > 0 then "  ⚠ \(.unreadable) unreadable" else "" end) ]
+                + ($live | map("\(.state // .status)\t\(.name)\t\(.idle_ms | age)"))
+                + (if $done > 0 then ["\($done) finished"] else [] end)
+                | join("\n"))
+    }' <<<"$data" 2>/dev/null || fail "claude-dash: could not parse producer output"

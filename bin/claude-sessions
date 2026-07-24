@@ -1,0 +1,302 @@
+#!/usr/bin/env bash
+# Emit every live Claude Code session on this machine as one JSON document.
+# The only component that knows Claude Code's on-disk layout.
+set -uo pipefail
+
+ROOT=${CLAUDE_DASH_ROOT:-$HOME/.claude}
+SESSIONS_DIR=$ROOT/sessions
+JOBS_DIR=$ROOT/jobs
+HOST=${CLAUDE_DASH_HOST:-$(uname -n)}
+NOW=$(date +%s%3N)
+
+CLI=${CLAUDE_DASH_CLI:-claude}
+STAMP=${CLAUDE_DASH_STAMP:-${XDG_RUNTIME_DIR:-/tmp}/claude-dash-arbitrated}
+ARBITRATE_EVERY=${CLAUDE_DASH_ARBITRATE_EVERY:-60}
+
+# proc_start PID — field 22 of /proc/PID/stat, non-zero exit if the pid is gone.
+# NOTE: `$(</proc/N/stat 2>/dev/null)` returns an EMPTY STRING successfully --
+# the redirection defeats bash's special read-a-file form. Check readability
+# first, then use the bare form, or every session looks dead.
+proc_start() {
+  local raw rest fields
+  [[ -r /proc/$1/stat ]] || return 1
+  raw=$(</proc/"$1"/stat) 2>/dev/null || return 1
+  rest=${raw#*') '}          # drop "PID (comm) "; comm may contain spaces
+  read -ra fields <<<"$rest"
+  printf '%s' "${fields[19]}"
+}
+
+# arbitration_due — true when the last CLI cross-check is older than the floor.
+arbitration_due() {
+  local now stamp_age
+  [[ -f $STAMP ]] || return 0
+  now=$(date +%s)
+  stamp_age=$((now - $(stat -c %Y "$STAMP" 2>/dev/null || printf '0')))
+  ((stamp_age >= ARBITRATE_EVERY))
+}
+
+# cli_sessions — normalized array from `claude agents --json`; non-zero on failure.
+# `name` is agent-authored free text same as the registry path, so it goes
+# through the same `clean` filter (shared via $JQ_CLEAN_DEF, set below) before
+# it can reach the Pango-markup tooltip.
+cli_sessions() {
+  local raw
+  command -v "$CLI" >/dev/null 2>&1 || return 1
+  raw=$("$CLI" agents --json 2>/dev/null) || return 1
+  [[ -n $raw ]] || return 1
+  jq -c "$JQ_CLEAN_DEF"'
+    [ .[]
+      | { kind:    (if .kind == "interactive" then "interactive" else "bg" end),
+          pid:     .pid,
+          name:    ((.name // "(unnamed)") | clean),
+          cwd:     (.cwd // ""),
+          status:  (.status // "idle"),
+          working: ((.status // "idle") | . == "busy" or . == "shell"),
+          state:   (.state // null),
+          needs:   null,
+          idle_ms: null,
+          job_id:  (.id // null) } ]
+    | map(. + { finished: (.kind == "bg" and (.state == "done" or .state == "error")) })
+    | sort_by( (if .finished then 1 else 0 end),
+               (if .kind == "interactive" then 0 else 1 end),
+               rank, 0 )' <<<"$raw" 2>/dev/null
+}
+
+# emit DEGRADED UNREADABLE SESSIONS_JSON
+emit() {
+  jq -n --arg host "$HOST" --argjson now "$NOW" \
+        --argjson degraded "$1" --argjson unreadable "$2" --argjson sessions "$3" \
+    '{host: $host, generated_at: $now, degraded: $degraded,
+      unreadable: $unreadable, sessions: $sessions}'
+}
+
+live=()
+unreadable=0
+
+if [[ -d $SESSIONS_DIR ]]; then
+  shopt -s nullglob
+  for file in "$SESSIONS_DIR"/*.json; do
+    content=$(<"$file") 2>/dev/null || { unreadable=$((unreadable + 1)); continue; }
+    if [[ ! $content =~ \"pid\":([0-9]+) ]]; then
+      unreadable=$((unreadable + 1)); continue
+    fi
+    pid=${BASH_REMATCH[1]}
+    if [[ ! $content =~ \"procStart\":\"([0-9]+)\" ]]; then
+      unreadable=$((unreadable + 1)); continue
+    fi
+    recorded=${BASH_REMATCH[1]}
+    current=$(proc_start "$pid") || continue   # process is gone
+    [[ $current == "$recorded" ]] || continue  # pid was reused
+    live+=("$file")
+  done
+  shopt -u nullglob
+fi
+
+# Session names and agent questions are LLM-authored free text. They are
+# rendered into a Pango-markup tooltip and a terminal frame, so strip
+# control characters and escape markup once, here, for every consumer --
+# including cli_sessions()'s CLI-fallback path above, which sources this too.
+# `shell` means the session is running a command, so it counts as working.
+# Derived once here; no consumer re-derives it from .status.
+# shellcheck disable=SC2016 # single-quoted on purpose: these are jq $vars, not bash's
+JQ_CLEAN_DEF='
+def clean:
+  if . == null then null
+  else gsub("[[:cntrl:]]"; "")
+       | gsub("&"; "&amp;") | gsub("<"; "&lt;") | gsub(">"; "&gt;")
+  end;
+def rank:
+  if .state == "blocked" then 0
+  elif .working then 1
+  else 2 end;
+'
+# Shared between the batch and per-file jq programs below so both stay in
+# sync; `record` reads $now from --argjson, bound in both invocations.
+# record/order (below) depend on $jobs/$now bound via --argjson, unlike
+# JQ_CLEAN_DEF, so cli_sessions() -- which has neither -- only pulls in the
+# clean/rank half; the full registry-merge shape would need those bindings
+# for no benefit (idle_ms and job/needs merging don't apply to the CLI path).
+# shellcheck disable=SC2016 # the rest of this string is single-quoted on
+# purpose (jq $vars, not bash's); only the leading "$JQ_CLEAN_DEF" expands.
+JQ_RECORD_DEF="$JQ_CLEAN_DEF"'
+def record:
+  . as $s
+  | (if $s.jobId then ($jobs[$s.jobId] // {}) else {} end) as $j
+  | { kind:    (if $s.kind == "bg" then "bg" else "interactive" end),
+      pid:     $s.pid,
+      name:    (($s.name // "(unnamed)") | clean),
+      cwd:     (($s.cwd // "") | clean),
+      status:  ($s.status // "idle"),
+      working: (($s.status // "idle") | . == "busy" or . == "shell"),
+      state:   ($j.state // null),
+      # $j comes from $jobs (== jobs_map, projected from job_rows below), whose
+      # needs text already went through `clean` inside job_row -- cleaning it
+      # again here would double-escape markup (`&lt;` -> `&amp;lt;`).
+      needs:   ($j.needs // null),
+      idle_ms: ($now - ($s.statusUpdatedAt // $s.updatedAt // $now)),
+      job_id:  ($s.jobId // null) }
+  | . + { finished: (.kind == "bg" and (.state == "done" or .state == "error")) };
+# Display order, applied to the assembled array identically on the batch and
+# per-file fallback paths: unfinished before finished, interactive before
+# background, then blocked before busy before idle, then most recently
+# active first.
+def order:
+  sort_by( (if .finished then 1 else 0 end),
+           (if .kind == "interactive" then 0 else 1 end),
+           rank,
+           (.idle_ms // 0) );
+# job_row($id; $mt) -- a standalone row built from jobs/<id>/state.json alone,
+# for a background agent whose process has already exited: no session file
+# exists for it at all, so `record` above never sees it. $mt is the
+# state.json mtime in epoch ms, used when .updatedAt is not itself a numeric
+# epoch-ms timestamp (in practice it is an ISO-8601 string).
+def job_row($id; $mt):
+  . as $j
+  | { kind:    "bg",
+      pid:     null,
+      name:    (($j.name // $id) | clean),
+      cwd:     (($j.cwd // "") | clean),
+      # A state.json with no usable `.state` (an empty object, or a file
+      # caught mid-write) must not read as busy forever: only a state we
+      # recognise as active makes the row working, never an absent one.
+      status:  ($j.tempo // $j.state // "idle"),
+      working: (($j.state // null) as $st | ($st != null and $st != "blocked" and $st != "done" and $st != "error")),
+      state:   ($j.state // null),
+      needs:   (($j.needs // null) | clean),
+      idle_ms: ($now - (if ($j.updatedAt | type) == "number" then $j.updatedAt else $mt end)),
+      job_id:  $id }
+  | . + { finished: (.state == "done" or .state == "error") };
+'
+
+# jobs/*/state.json is a row source in its own right, not just a lookup: a
+# background agent whose process has already exited -- including one that is
+# blocked and waiting on the user -- leaves a job directory with NO session
+# file at all, so it never appears via `record` above no matter what.
+# `jobs_map` (job id -> {state, needs}, consumed by `record` to enrich a live
+# session row) is built as a PROJECTION of `job_rows`, not a second parse of
+# the job files: that way a job's state/needs only ever come from a file that
+# has already parsed successfully into job_rows, so one corrupt file can
+# never blind an unrelated session's lookup the way a from-scratch batch call
+# over all job files -- with its single all-or-nothing failure mode -- would.
+# `mtimes` is a single `stat` call over every state.json file (not one
+# process per job dir), feeding job_row's idle_ms fallback for the common
+# case where .updatedAt is an ISO-8601 string rather than a numeric epoch
+# timestamp; the fallback below reuses this same map instead of re-`stat`ing
+# per file.
+job_rows='[]'
+jobs_map='{}'
+if compgen -G "$JOBS_DIR/*/state.json" >/dev/null 2>&1; then
+  mtimes=$(stat -c $'%n\t%Y' "$JOBS_DIR"/*/state.json 2>/dev/null)
+  if job_rows=$(jq -c -n --argjson now "$NOW" --arg mtimes "$mtimes" \
+      "$JQ_RECORD_DEF"'
+        ( $mtimes | split("\n") | map(select(length > 0) | split("\t"))
+            | map({ key: (.[0] | split("/")[-2]), value: ((.[1] | tonumber) * 1000) })
+            | from_entries ) as $mt
+        | [ inputs | (input_filename | split("/")[-2]) as $id
+            | job_row($id; ($mt[$id] // $now)) ]
+      ' "$JOBS_DIR"/*/state.json 2>/dev/null); then
+    : # common case: every job file parsed in one batched call
+  else
+    # One job file was unreadable JSON, and jq has no partial-batch mode -- a
+    # single bad file fails the whole call. Re-run per file instead, exactly
+    # like the session fallback above: one jq call per file (no per-dir
+    # `stat` -- $mtimes above already covers every file in a single process
+    # -- and no per-item append call), collected with `printf | jq -s` at the
+    # end so a corrupt file among N job dirs costs one process, not three.
+    declare -A job_mtime=()
+    while IFS=$'\t' read -r fn ts; do
+      [[ -n $fn ]] || continue
+      id=${fn%/state.json}; id=${id##*/}
+      job_mtime[$id]=$((ts * 1000))
+    done <<<"$mtimes"
+    job_rows='[]'
+    records=()
+    for jf in "$JOBS_DIR"/*/state.json; do
+      id=${jf%/state.json}; id=${id##*/}
+      mt=${job_mtime[$id]:-$NOW}
+      if record=$(jq -c --argjson now "$NOW" --argjson mt "$mt" --arg id "$id" \
+          "$JQ_RECORD_DEF"'job_row($id; $mt)' "$jf" 2>/dev/null); then
+        records+=("$record")
+      else
+        unreadable=$((unreadable + 1))
+      fi
+    done
+    ((${#records[@]})) && job_rows=$(printf '%s\n' "${records[@]}" \
+      | jq -c -s --argjson now "$NOW" "$JQ_RECORD_DEF"'order')
+  fi
+  [[ $job_rows != '[]' ]] && jobs_map=$(jq -c \
+    'map(select(.job_id != null) | {key: .job_id, value: {state, needs}}) | from_entries' \
+    <<<"$job_rows")
+fi
+
+sessions='[]'
+if ((${#live[@]})); then
+  if sessions=$(jq -c -n --argjson now "$NOW" --argjson jobs "$jobs_map" \
+      "$JQ_RECORD_DEF"'[ inputs | record ] | order' "${live[@]}" 2>/dev/null); then
+    : # common case: the whole live set parsed in one batched call
+  else
+    # One file in the batch was unreadable JSON, and jq has no partial-batch
+    # mode -- a single bad file fails the whole call. Re-run per file instead:
+    # slower, but only taken in this rare corrupt case, and it charges the
+    # bad file alone to `unreadable` rather than losing every good session.
+    records=()
+    for file in "${live[@]}"; do
+      if record=$(jq -c --argjson now "$NOW" --argjson jobs "$jobs_map" \
+          "$JQ_RECORD_DEF"'record' "$file" 2>/dev/null); then
+        records+=("$record")
+      else
+        unreadable=$((unreadable + 1))
+      fi
+    done
+    sessions='[]'
+    ((${#records[@]})) && sessions=$(printf '%s\n' "${records[@]}" \
+      | jq -c -s --argjson now "$NOW" --argjson jobs "$jobs_map" "$JQ_RECORD_DEF"'order')
+  fi
+fi
+
+# Merge: a job id already covered by a live session row (session-derived rows
+# carry pid, cwd and real timestamps) keeps that row and gets no duplicate;
+# every other job row is appended. `order` re-runs over the combined set so
+# blocked-first/finished-last placement is identical whether a row came from
+# a session file, a job file, or (for a covered id) both.
+if [[ $job_rows != '[]' ]]; then
+  if merged=$(jq -c -n --argjson s "$sessions" --argjson j "$job_rows" \
+      "$JQ_RECORD_DEF"'
+        ( [ $s[].job_id | select(. != null) ] ) as $covered
+        | ($j | map(select(.job_id as $id | ($covered | index($id)) | not))) as $orphans
+        | ($s + $orphans) | order
+      ' 2>/dev/null); then
+    sessions=$merged
+  fi
+fi
+
+# Path 1: no registry at all. Always degraded, but the CLI cross-check is
+# rate-limited exactly like Path 2 -- same ~0.5s/~300MB cost, and this branch
+# is hit on every poll for a fresh install or a misconfigured
+# CLAUDE_DASH_ROOT, so an unconditional call would shell out forever.
+if [[ ! -d $SESSIONS_DIR ]]; then
+  if arbitration_due; then
+    mkdir -p "$(dirname "$STAMP")" 2>/dev/null
+    : >"$STAMP"
+    if fallback=$(cli_sessions) && [[ -n $fallback ]]; then
+      emit true "$unreadable" "$fallback"
+      exit 0
+    fi
+  fi
+  emit true "$unreadable" "$sessions"
+  exit 0
+fi
+
+# Path 2: registry parsed but empty. Indistinguishable from "nothing running"
+# by inspection, so arbitrate against the CLI -- at most once per minute,
+# because that call costs ~0.5s and ~300MB.
+if [[ $sessions == '[]' ]] && arbitration_due; then
+  mkdir -p "$(dirname "$STAMP")" 2>/dev/null
+  : >"$STAMP"
+  if fallback=$(cli_sessions) && [[ $(jq -r 'length' <<<"$fallback" 2>/dev/null || printf '0') -gt 0 ]]; then
+    emit true "$unreadable" "$fallback"
+    exit 0
+  fi
+fi
+
+emit false "$unreadable" "$sessions"

@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# waybar on-click: show or hide the claude-dash scratchpad window.
+set -uo pipefail
+
+APP_ID=claude-dash
+BOARD=${CLAUDE_DASH_BOARD:-claude-dash}
+PIDFILE=${CLAUDE_DASH_PIDFILE:-${XDG_RUNTIME_DIR:-/tmp}/claude-dash.pid}
+LOCKFILE=$PIDFILE.lock
+
+notify() {
+  command -v notify-send >/dev/null 2>&1 && notify-send "claude-dash" "$1"
+  printf 'claude-dash: %s\n' "$1" >&2
+}
+
+# window_state — "absent" when no window carries our app_id, otherwise the
+# window's scratchpad_state: "none" (a normal window), or "fresh"/"changed"
+# (parked in the scratchpad). sway 1.10 exposes this on every con.
+window_state() {
+  swaymsg -t get_tree 2>/dev/null \
+    | jq -r --arg a "$APP_ID" \
+        '[recurse(.nodes[]?, .floating_nodes[]?) | select(.app_id == $a)][0]
+         | if . == null then "absent" else (.scratchpad_state // "none") end' \
+        2>/dev/null || printf 'absent'
+}
+
+# visible — true when our window is currently on screen. Used only to decide
+# which signal to send the board after the toggle.
+visible() {
+  swaymsg -t get_tree 2>/dev/null \
+    | jq -e --arg a "$APP_ID" \
+        '[recurse(.nodes[]?, .floating_nodes[]?)
+          | select(.app_id == $a and .visible == true)] | length > 0' \
+        >/dev/null 2>&1
+}
+
+# board_pid — the running board's pid, or non-zero exit if there is not one.
+# A pidfile left behind by a crash names a dead pid, so verify before trusting.
+board_pid() {
+  local pid
+  [[ -r $PIDFILE ]] || return 1
+  pid=$(<"$PIDFILE") 2>/dev/null || return 1
+  [[ $pid =~ ^[0-9]+$ ]] || return 1
+  [[ -d /proc/$pid ]] || return 1
+  printf '%s' "$pid"
+}
+
+# signal_board — tell the board to slow down when hidden, speed up when shown.
+# The board writes its pid to PIDFILE; matching on the command line instead
+# breaks whenever the scripts live outside a directory named *bin.
+signal_board() {
+  local pid
+  pid=$(board_pid) || return 0
+  kill -"$1" "$pid" 2>/dev/null || true
+}
+
+command -v swaymsg >/dev/null 2>&1 || { notify "swaymsg not found — not running under sway"; exit 1; }
+command -v jq      >/dev/null 2>&1 || { notify "jq is not installed"; exit 1; }
+
+state=$(window_state)
+
+# A window that exists but was never parked in the scratchpad ("none") cannot be
+# revealed by `scratchpad show` — sway errors and the button becomes a silent
+# no-op forever. That happens whenever the for_window rule is missing or sway
+# has not been reloaded, which is the normal state of a freshly set-up machine.
+# Moving it in first makes the toggle correct with or without the sway rule.
+if [[ $state != absent ]]; then
+  [[ $state == none ]] && swaymsg "[app_id=\"$APP_ID\"] move scratchpad" >/dev/null 2>&1
+  # `scratchpad show` on an already-visible scratchpad window hides it, so this
+  # single command is the whole toggle.
+  swaymsg "[app_id=\"$APP_ID\"] scratchpad show" >/dev/null 2>&1
+  if visible; then signal_board USR2; else signal_board USR1; fi
+  exit 0
+fi
+
+command -v foot >/dev/null 2>&1 || { notify "foot is not installed"; exit 1; }
+command -v "$BOARD" >/dev/null 2>&1 || { notify "$BOARD is not on PATH — run install.sh"; exit 1; }
+
+# Two clicks in quick succession both see an absent window and would each launch
+# a board, leaving two processes and two windows. Serialise the launch branch
+# and re-check under the lock. flock ships with util-linux, already present on
+# any sway desktop.
+exec 9>"$LOCKFILE"
+flock -n 9 || exit 0          # another click is already launching; nothing to do
+if board_pid >/dev/null; then
+  exit 0                      # a board is running, it just has no window yet
+fi
+
+# 9>&- closes the launch lock's fd in the child before exec, so the lock is
+# held only for the launch itself, not for the board's whole lifetime -- a
+# board that inherited fd 9 open would keep the lockfile held until it exits,
+# blocking every double-click "another launch is in progress" check forever.
+setsid foot --app-id="$APP_ID" -e "$BOARD" 9>&- >/dev/null 2>&1 &
+
+# The for_window rule parks it in the scratchpad; wait for it, then reveal it.
+# Same "none" handling as above, so a missing sway rule still yields a working
+# button on the very first click.
+for _ in $(seq 20); do
+  sleep 0.05
+  state=$(window_state)
+  [[ $state == absent ]] && continue
+  [[ $state == none ]] && swaymsg "[app_id=\"$APP_ID\"] move scratchpad" >/dev/null 2>&1
+  swaymsg "[app_id=\"$APP_ID\"] scratchpad show" >/dev/null 2>&1
+  signal_board USR2
+  exit 0
+done
+notify "the board window did not appear within 1s"
+exit 1
