@@ -1,0 +1,9 @@
+/* >>> claude-dash */
+#custom-claude {
+  padding: 0 10px;
+}
+#custom-claude.quiet  { color: #727169; }              /* kanagawa fujiGray  */
+#custom-claude.active { color: #7e9cd8; }              /* kanagawa crystalBlue */
+#custom-claude.alert  { color: #1f1f28; background-color: #ffa066; } /* surimiOrange */
+#custom-claude.error  { color: #e82424; }              /* samuraiRed */
+/* <<< claude-dash */

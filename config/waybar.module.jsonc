@@ -1,0 +1,12 @@
+// >>> claude-dash
+// Add "custom/claude" to modules-right, then paste this block alongside the
+// other custom modules. __BIN__ is replaced by install.sh.
+"custom/claude": {
+  "format": "󰚩 {}",
+  "return-type": "json",
+  "exec": "__BIN__/claude-dash-badge",
+  "interval": 2,
+  "on-click": "__BIN__/claude-dash-toggle",
+  "tooltip": true
+}
+// <<< claude-dash

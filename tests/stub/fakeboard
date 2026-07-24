@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# A stand-in for the board that records the signals it is sent. A single
+# `sleep 5` would not do: bash only dispatches a pending trap once the
+# foreground external command it is waiting on returns, so a signal sent
+# mid-sleep would sit unhandled until the full 5s elapsed. Short ticks give
+# bash a chance to run the trap right after it arrives.
+trap 'printf "USR1\n" >>"$STUB_LOG"' USR1
+trap 'printf "USR2\n" >>"$STUB_LOG"' USR2
+for _ in $(seq 100); do sleep 0.05; done

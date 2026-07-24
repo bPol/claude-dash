@@ -409,4 +409,76 @@ wait "$job_b" 2>/dev/null || true
 rm -f "$test_pidfile"
 rm -rf "$(dirname "$p")"
 
+printf '\nclaude-dash-toggle\n'
+
+STUB_BIN=$HERE/stub
+
+# tree_json STATE VISIBLE — a minimal get_tree reply. STATE "absent" yields a
+# tree with no matching window at all.
+tree_json() {
+  if [[ $1 == absent ]]; then
+    jq -n '{nodes:[{nodes:[],floating_nodes:[]}]}'
+  else
+    jq -n --arg s "$1" --argjson v "$2" \
+      '{nodes:[{nodes:[{app_id:"claude-dash",scratchpad_state:$s,visible:$v}],
+                floating_nodes:[]}]}'
+  fi
+}
+
+# run_toggle STATE VISIBLE — run the toggle against a canned tree, print the log.
+# Unless CLAUDE_DASH_NO_BOARD is set, a real throwaway process stands in for the
+# board: it traps USR1/USR2, appends what it received to the log, and its pid
+# goes in the pidfile. That exercises the signal path end to end, which stubbing
+# the `kill` builtin cannot do.
+run_toggle() {
+  local d fake_pid; d=$(mktemp -d "${TMPDIR:-/tmp}/claude-dash-toggle.XXXXXX")
+  tree_json "$1" "$2" >"$d/tree.json"
+  : >"$d/log"
+  if [[ -z ${CLAUDE_DASH_NO_BOARD:-} ]]; then
+    STUB_LOG=$d/log "$STUB_BIN/fakeboard" & fake_pid=$!
+    printf '%s' "$fake_pid" >"$d/board.pid"
+  fi
+  PATH="$STUB_BIN:$PATH" STUB_TREE=$d/tree.json STUB_LOG=$d/log \
+    CLAUDE_DASH_PIDFILE=$d/board.pid \
+    CLAUDE_DASH_BOARD=$STUB_BIN/foot timeout 5 "$BIN/claude-dash-toggle" \
+    >/dev/null 2>&1
+  local rc=$?
+  sleep 0.2                      # let the trap in the fake board run
+  [[ -n ${fake_pid:-} ]] && kill "$fake_pid" 2>/dev/null
+  cat "$d/log"
+  rm -rf "$d"
+  return "$rc"
+}
+
+log=$(run_toggle fresh true)
+check "parked window is shown" \
+  "$(printf '%s' "$log" | grep -c 'scratchpad show')" "1"
+check "parked window is not moved again" \
+  "$(printf '%s' "$log" | grep -c 'move scratchpad')" "0"
+check "showing a visible window signals the board to resume" \
+  "$(printf '%s' "$log" | grep -c '^USR2$')" "1"
+
+log=$(run_toggle fresh false)
+check "hiding signals the board to idle" \
+  "$(printf '%s' "$log" | grep -c '^USR1$')" "1"
+
+log=$(run_toggle none true)
+check "unparked window is moved to the scratchpad first" \
+  "$(printf '%s' "$log" | grep -c 'move scratchpad')" "1"
+check "move precedes show" \
+  "$(printf '%s' "$log" | grep -n 'move scratchpad\|scratchpad show' | head -1 | grep -c move)" "1"
+
+# No board running for this case, so no stand-in process and no pidfile.
+log=$(CLAUDE_DASH_NO_BOARD=1 run_toggle absent false); TOGGLE_RC=$?
+check "absent window launches the board" \
+  "$(printf '%s' "$log" | grep -c '^foot ')" "1"
+check "a window that never appears exits non-zero" \
+  "$([[ $TOGGLE_RC -ne 0 ]] && echo nonzero || echo zero)" "nonzero"
+
+# A live board with no window yet (the double-click window) must not launch a
+# second one -- this is the race the launch lock exists to prevent.
+log=$(run_toggle absent false)
+check "a live board is never launched twice" \
+  "$(printf '%s' "$log" | grep -c '^foot ')" "0"
+
 summary

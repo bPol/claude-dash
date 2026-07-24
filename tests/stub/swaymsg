@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Fake swaymsg: serve a canned tree, log every command it is asked to run.
+if [[ "$*" == "-t get_tree" ]]; then
+  cat "$STUB_TREE"
+else
+  printf '%s\n' "$*" >>"$STUB_LOG"
+fi
