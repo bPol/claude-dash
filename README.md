@@ -55,3 +55,12 @@ chosen because `claude agents --json` costs ~0.5 s and ~300 MB per call, which i
 not something to run every 2 seconds. If the layout ever changes, the tools fall
 back to `claude agents --json` and the board header shows
 `⚠ degraded (CLI fallback)` so you know why it got slower.
+
+## Known follow-ups
+
+Small things the final review flagged and we chose not to block on:
+
+- The board's truncation ellipsis covers session rows but not the header or the
+  collapsed "N finished" footer, which are still hard-cut at very narrow widths.
+- The toggle closes fd 9 so the launch lock is not held for the board's lifetime,
+  but there is no test that would catch it if that were removed.
