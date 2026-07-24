@@ -190,6 +190,7 @@ check "orphan blocked job_id is the job directory name" \
 rm -rf "$root"
 
 root=$(new_root)
+# shellcheck disable=SC1010 # "done" here is the job state arg, not the loop keyword
 mk_orphan_job "$root" j-orphan-done done "sales" "/home/u/projects/other"
 out=$(CLAUDE_DASH_ROOT=$root "$BIN/claude-sessions")
 check "orphan done job appears as a row" \
@@ -373,6 +374,40 @@ out=$(CLAUDE_DASH_PRODUCER=/nonexistent/producer "$BIN/claude-dash-badge")
 check "producer failure yields the error class" "$(jq -r '.class' <<<"$out")" "error"
 check "producer failure still renders a glyph, never a blank" \
   "$(jq -r '.text' <<<"$out")" "?"
+
+# The registry exists but every file is corrupt and the CLI is unreachable:
+# the producer legitimately emits degraded:false, unreadable:N, sessions:[].
+# That must not read as "nothing running" (0▸0▸0, quiet) -- it's the exact
+# confusion this tool exists to remove.
+d=$(mktemp -d "${TMPDIR:-/tmp}/claude-dash-prod.XXXXXX")
+{ printf '#!/usr/bin/env bash\ncat <<'"'"'JSON'"'"'\n'
+  jq -n '{host:"testbox",generated_at:0,degraded:false,unreadable:3,sessions:[]}'
+  printf 'JSON\n'; } >"$d/producer"
+chmod +x "$d/producer"
+out=$(CLAUDE_DASH_PRODUCER=$d/producer "$BIN/claude-dash-badge")
+check "zero sessions with unreadable files renders as unknown, not quiet" \
+  "$(jq -r '.text' <<<"$out")" "?"
+check "zero sessions with unreadable files is the error class" \
+  "$(jq -r '.class' <<<"$out")" "error"
+check "unreadable count is surfaced in the tooltip" \
+  "$(jq -r '.tooltip | contains("3 unreadable")' <<<"$out")" "true"
+rm -rf "$d"
+
+# unreadable > 0 alongside real sessions must still surface in the tooltip
+# (only the zero-sessions case flips text/class to the unknown glyph).
+d=$(mktemp -d "${TMPDIR:-/tmp}/claude-dash-prod.XXXXXX")
+{ printf '#!/usr/bin/env bash\ncat <<'"'"'JSON'"'"'\n'
+  jq -n '{host:"testbox",generated_at:0,degraded:false,unreadable:1,
+          sessions:[{"kind":"interactive","pid":1,"name":"n","cwd":"/x","status":"busy",
+                     "working":true,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]}'
+  printf 'JSON\n'; } >"$d/producer"
+chmod +x "$d/producer"
+out=$(CLAUDE_DASH_PRODUCER=$d/producer "$BIN/claude-dash-badge")
+check "unreadable alongside real sessions keeps the normal glyph" \
+  "$(jq -r '.text' <<<"$out")" "1▸0▸0"
+check "unreadable alongside real sessions is still surfaced in the tooltip" \
+  "$(jq -r '.tooltip | contains("1 unreadable")' <<<"$out")" "true"
+rm -rf "$d"
 
 printf '\nclaude-dash board\n'
 

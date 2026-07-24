@@ -26,12 +26,15 @@ jq -c -r '
   | ($live | map(select(.working))            | length) as $busy
   | ($live | map(select((.working | not) and .state != "blocked")) | length) as $idle
   | ((.sessions | map(select(.finished)) | length)) as $done
+  | ((.sessions | length) == 0 and .unreadable > 0) as $blind
   | {
-      text: "\($busy)▸\($blocked)▸\($idle)",
-      class: (if $blocked > 0 then "alert"
+      text: (if $blind then "?" else "\($busy)▸\($blocked)▸\($idle)" end),
+      class: (if $blind then "error"
+              elif $blocked > 0 then "alert"
               elif $busy > 0 then "active"
               else "quiet" end),
-      tooltip: ([ .host + (if .degraded then "  ⚠ degraded (CLI fallback)" else "" end) ]
+      tooltip: ([ .host + (if .degraded then "  ⚠ degraded (CLI fallback)" else "" end)
+                        + (if .unreadable > 0 then "  ⚠ \(.unreadable) unreadable" else "" end) ]
                 + ($live | map("\(.state // .status)\t\(.name)\t\(.idle_ms | age)"))
                 + (if $done > 0 then ["\($done) finished"] else [] end)
                 | join("\n"))
