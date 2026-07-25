@@ -7,6 +7,17 @@ source "$HERE/lib.sh"
 BIN=$HERE/../bin
 DEAD_PID=4194303   # above /proc/sys/kernel/pid_max default, can never be live
 
+producer_stub() {   # producer_stub SESSIONS_JSON -> path to a stub producer
+  local d
+  d=$(mktemp -d "${TMPDIR:-/tmp}/claude-dash-prod.XXXXXX")
+  { printf '#!/usr/bin/env bash\ncat <<'"'"'JSON'"'"'\n'
+    jq -n --argjson s "$1" '{host:"testbox",generated_at:0,degraded:false,unreadable:0,sessions:$s}'
+    printf 'JSON\n'
+  } >"$d/producer"
+  chmod +x "$d/producer"
+  printf '%s' "$d/producer"
+}
+
 # Hermetic by default: no test may reach the real `claude` binary or the real
 # shared arbitration stamp (${XDG_RUNTIME_DIR}/claude-dash-arbitrated), even
 # one that forgets to override. An empty/all-dead fixture legitimately
@@ -590,18 +601,175 @@ check "a concurrent fetch for the same host is skipped, not double-run" \
   "$(wc -l <"$ssh_log" | tr -d ' ')" "1"
 rm -rf "$root"
 
-printf '\nclaude-dash-badge\n'
+printf '\nclaude-sessions-all\n'
 
-producer_stub() {   # producer_stub SESSIONS_JSON -> path to a stub producer
-  local d
-  d=$(mktemp -d "${TMPDIR:-/tmp}/claude-dash-prod.XXXXXX")
-  { printf '#!/usr/bin/env bash\ncat <<'"'"'JSON'"'"'\n'
-    jq -n --argjson s "$1" '{host:"testbox",generated_at:0,degraded:false,unreadable:0,sessions:$s}'
-    printf 'JSON\n'
-  } >"$d/producer"
-  chmod +x "$d/producer"
-  printf '%s' "$d/producer"
-}
+# No cache, no hosts file: output must be plain claude-sessions plus a host
+# field on every session and a one-entry hosts array -- the fallback that
+# keeps a single-machine setup working unchanged.
+root=$(new_root)
+cache=$root/cache
+hosts=$root/no-such-hosts-file
+lp=$(producer_stub '[{"kind":"interactive","pid":1,"name":"local task","cwd":"/x","status":"busy","working":true,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
+out=$(CLAUDE_DASH_LOCAL_PRODUCER=$lp CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_HOSTS=$hosts \
+      "$BIN/claude-sessions-all")
+check "no cache/no hosts: session count matches the local producer" \
+  "$(jq -r '.sessions | length' <<<"$out")" "1"
+check "no cache/no hosts: session gets the local host field" \
+  "$(jq -r '.sessions[0].host' <<<"$out")" "testbox"
+check "no cache/no hosts: hosts array has exactly one entry" \
+  "$(jq -r '.hosts | length' <<<"$out")" "1"
+check "no cache/no hosts: the one hosts entry is local" \
+  "$(jq -r '.hosts[0].kind' <<<"$out")" "local"
+check "no cache/no hosts: the one hosts entry is fresh" \
+  "$(jq -r '.hosts[0].status' <<<"$out")" "fresh"
+check "no cache/no hosts: top-level host matches the local producer's" \
+  "$(jq -r '.host' <<<"$out")" "testbox"
+rm -rf "$(dirname "$lp")" "$root"
+
+# A fresh remote cache merges in and is labelled with its host.
+root=$(new_root)
+cache=$root/cache
+lp=$(producer_stub '[{"kind":"interactive","pid":1,"name":"local task","cwd":"/x","status":"busy","working":true,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
+mk_cache_file "$cache" "remote1" true "" 0 \
+  '[{"kind":"interactive","pid":9,"name":"remote task","cwd":"/y","status":"idle","working":false,"state":null,"needs":null,"idle_ms":500,"job_id":null,"finished":false}]'
+out=$(CLAUDE_DASH_LOCAL_PRODUCER=$lp CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_HOSTS=$root/no-hosts \
+      "$BIN/claude-sessions-all")
+check "fresh remote: total session count is local + remote" \
+  "$(jq -r '.sessions | length' <<<"$out")" "2"
+check "fresh remote: the remote row is labelled with its host" \
+  "$(jq -r '[.sessions[] | select(.name == "remote task")][0].host' <<<"$out")" "remote1"
+check "fresh remote: hosts array includes the remote" \
+  "$(jq -r '.hosts | length' <<<"$out")" "2"
+check "fresh remote: remote host status is fresh" \
+  "$(jq -r '[.hosts[] | select(.host == "remote1")][0].status' <<<"$out")" "fresh"
+rm -rf "$(dirname "$lp")" "$root"
+
+# A stale remote (older than CLAUDE_DASH_STALE_AFTER) is marked stale but its
+# rows still show -- staleness must never hide data.
+root=$(new_root)
+cache=$root/cache
+lp=$(producer_stub '[]')
+mk_cache_file "$cache" "remote2" true "" 100 \
+  '[{"kind":"bg","pid":null,"name":"stale remote row","cwd":"/z","status":"idle","working":false,"state":null,"needs":null,"idle_ms":100000,"job_id":"j1","finished":false}]'
+out=$(CLAUDE_DASH_LOCAL_PRODUCER=$lp CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_HOSTS=$root/no-hosts \
+      CLAUDE_DASH_STALE_AFTER=45 "$BIN/claude-sessions-all")
+check "stale remote: host status is stale" \
+  "$(jq -r '[.hosts[] | select(.host == "remote2")][0].status' <<<"$out")" "stale"
+check "stale remote: its row still shows" \
+  "$(jq -r '[.sessions[] | select(.name == "stale remote row")] | length' <<<"$out")" "1"
+rm -rf "$(dirname "$lp")" "$root"
+
+# An unreachable remote (last fetch failed) shows the error and keeps
+# last-known rows instead of losing them.
+root=$(new_root)
+cache=$root/cache
+lp=$(producer_stub '[]')
+mk_cache_file "$cache" "remote3" false "unreachable" 5 \
+  '[{"kind":"interactive","pid":9,"name":"last known remote row","cwd":"/y","status":"idle","working":false,"state":null,"needs":null,"idle_ms":500,"job_id":null,"finished":false}]'
+out=$(CLAUDE_DASH_LOCAL_PRODUCER=$lp CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_HOSTS=$root/no-hosts \
+      "$BIN/claude-sessions-all")
+check "unreachable remote: host status is unreachable" \
+  "$(jq -r '[.hosts[] | select(.host == "remote3")][0].status' <<<"$out")" "unreachable"
+check "unreachable remote: error is surfaced" \
+  "$(jq -r '[.hosts[] | select(.host == "remote3")][0].error' <<<"$out")" "unreachable"
+check "unreachable remote: last-known row still shows" \
+  "$(jq -r '[.sessions[] | select(.name == "last known remote row")] | length' <<<"$out")" "1"
+rm -rf "$(dirname "$lp")" "$root"
+
+# A cache file with genuinely corrupt JSON must not break the merge or lose
+# local rows -- only that one remote's contribution is lost.
+root=$(new_root)
+cache=$root/cache
+mkdir -p "$cache"
+printf 'not json at all {{{' >"$cache/remote4.json"
+lp=$(producer_stub '[{"kind":"interactive","pid":1,"name":"local survives","cwd":"/x","status":"busy","working":true,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
+out=$(CLAUDE_DASH_LOCAL_PRODUCER=$lp CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_HOSTS=$root/no-hosts \
+      "$BIN/claude-sessions-all")
+check "corrupt cache file: exit code is still 0" "$?" "0"
+check "corrupt cache file: local row survives" \
+  "$(jq -r '[.sessions[] | select(.name == "local survives")] | length' <<<"$out")" "1"
+check "corrupt cache file: output is still valid JSON" \
+  "$(jq -e . >/dev/null 2>&1 <<<"$out" && echo yes || echo no)" "yes"
+rm -rf "$(dirname "$lp")" "$root"
+
+# Ordering: every local row precedes every remote row.
+root=$(new_root)
+cache=$root/cache
+lp=$(producer_stub '[
+  {"kind":"interactive","pid":1,"name":"local a","cwd":"/x","status":"busy","working":true,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false},
+  {"kind":"interactive","pid":2,"name":"local b","cwd":"/x","status":"idle","working":false,"state":null,"needs":null,"idle_ms":2000,"job_id":null,"finished":false}]')
+mk_cache_file "$cache" "remote5" true "" 0 \
+  '[{"kind":"interactive","pid":9,"name":"remote a","cwd":"/y","status":"idle","working":false,"state":null,"needs":null,"idle_ms":500,"job_id":null,"finished":false}]'
+out=$(CLAUDE_DASH_LOCAL_PRODUCER=$lp CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_HOSTS=$root/no-hosts \
+      "$BIN/claude-sessions-all")
+check "ordering: local rows precede remote rows" \
+  "$(jq -r '[.sessions[].host] | . as $h | ($h | index("testbox")) < ($h | index("remote5"))' <<<"$out")" \
+  "true"
+check "ordering: first two rows are local" \
+  "$(jq -r '.sessions[0:2] | map(.host == "testbox") | all' <<<"$out")" "true"
+check "ordering: last row is remote" \
+  "$(jq -r '.sessions[-1].host' <<<"$out")" "remote5"
+rm -rf "$(dirname "$lp")" "$root"
+
+# claude-sessions-all must never block on the network: when a fetch is due
+# (no cache, hosts file present) it spawns claude-dash-fetch fully detached
+# and returns immediately with whatever is on disk right now, even though
+# the ssh it kicks off will sleep for 10s.
+root=$(new_root)
+cache=$root/cache
+hosts=$root/hosts
+mk_hosts_file "$hosts" "slow-host"
+lp=$(producer_stub '[]')
+t0=$(date +%s%N)
+out=$(STUB_SSH_SLEEP=10 CLAUDE_DASH_LOCAL_PRODUCER=$lp CLAUDE_DASH_CACHE=$cache \
+      CLAUDE_DASH_HOSTS=$hosts CLAUDE_DASH_SSH="$SSH_STUB" \
+      CLAUDE_DASH_FETCH="$BIN/claude-dash-fetch" "$BIN/claude-sessions-all")
+t1=$(date +%s%N)
+elapsed_ms=$(((t1 - t0) / 1000000))
+printf '  .. claude-sessions-all with a 10s-sleeping remote returned in %dms\n' "$elapsed_ms"
+check "does not block: returns well under the remote's 10s sleep" \
+  "$([[ $elapsed_ms -lt 2000 ]] && echo fast || echo slow)" "fast"
+check "does not block: still returns valid JSON while the fetch runs in the background" \
+  "$(jq -e . >/dev/null 2>&1 <<<"$out" && echo yes || echo no)" "yes"
+rm -rf "$(dirname "$lp")" "$root"
+
+# Measure the plain-old-local-only baseline for comparison in the report.
+root=$(new_root)
+lp=$(producer_stub '[]')
+t0=$(date +%s%N)
+"$BIN/claude-sessions" >/dev/null 2>&1
+t1=$(date +%s%N)
+baseline_ms=$(((t1 - t0) / 1000000))
+printf '  .. plain claude-sessions (empty registry) baseline: %dms\n' "$baseline_ms"
+rm -rf "$(dirname "$lp")" "$root"
+
+# The spawn is rate-limited: a fetch is triggered at most once per
+# CLAUDE_DASH_FETCH_EVERY window, so a 2s poll cannot spawn one every tick.
+root=$(new_root)
+cache=$root/cache
+hosts=$root/hosts
+mk_hosts_file "$hosts" "ok-host"
+lp=$(producer_stub '[]')
+fetch_log=$root/fetch-log
+fetch_stub_dir=$(mktemp -d "${TMPDIR:-/tmp}/claude-dash-fetchstub.XXXXXX")
+cat >"$fetch_stub_dir/fetch" <<STUB
+#!/usr/bin/env bash
+printf 'called\n' >>"$fetch_log"
+STUB
+chmod +x "$fetch_stub_dir/fetch"
+CLAUDE_DASH_LOCAL_PRODUCER=$lp CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_HOSTS=$hosts \
+  CLAUDE_DASH_FETCH="$fetch_stub_dir/fetch" CLAUDE_DASH_FETCH_EVERY=20 \
+  "$BIN/claude-sessions-all" >/dev/null
+sleep 0.2
+CLAUDE_DASH_LOCAL_PRODUCER=$lp CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_HOSTS=$hosts \
+  CLAUDE_DASH_FETCH="$fetch_stub_dir/fetch" CLAUDE_DASH_FETCH_EVERY=20 \
+  "$BIN/claude-sessions-all" >/dev/null
+sleep 0.2
+check "a second call inside the rate-limit window does not spawn another fetch" \
+  "$(wc -l <"$fetch_log" 2>/dev/null | tr -d ' ')" "1"
+rm -rf "$(dirname "$lp")" "$fetch_stub_dir" "$root"
+
+printf '\nclaude-dash-badge\n'
 
 p=$(producer_stub '[
   {"kind":"interactive","pid":1,"name":"api refactor","cwd":"/home/u/x","status":"busy","working":true,"state":null,"needs":null,"idle_ms":120000,"job_id":null,"finished":false},

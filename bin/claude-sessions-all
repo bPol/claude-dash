@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# The merged producer: local sessions (from claude-sessions) plus every
+# remote host's last-fetched cache (from claude-dash-fetch), with a `host`
+# field on every row. Never touches the network itself -- it only reads
+# whatever claude-dash-fetch already wrote, and kicks off a fully detached
+# refresh when that looks stale. This is what the badge and board read by
+# default.
+set -uo pipefail
+
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+LOCAL_PRODUCER=${CLAUDE_DASH_LOCAL_PRODUCER:-$HERE/claude-sessions}
+CACHE_DIR=${CLAUDE_DASH_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/claude-dash}
+HOSTS_FILE=${CLAUDE_DASH_HOSTS:-$HOME/.config/claude-dash/hosts}
+STALE_AFTER=${CLAUDE_DASH_STALE_AFTER:-45}
+FETCH_EVERY=${CLAUDE_DASH_FETCH_EVERY:-20}
+FETCH_BIN=${CLAUDE_DASH_FETCH:-$HERE/claude-dash-fetch}
+FETCH_STAMP=${CLAUDE_DASH_FETCH_STAMP:-$CACHE_DIR/.fetch-trigger-stamp}
+NOW_MS=$(date +%s%3N)
+
+# --- local rows -------------------------------------------------------
+local_out=$("$LOCAL_PRODUCER" 2>/dev/null) || local_out=''
+if [[ -z $local_out ]] || ! jq -e . >/dev/null 2>&1 <<<"$local_out"; then
+  fallback_host=${CLAUDE_DASH_HOST:-$(uname -n)}
+  local_out=$(jq -n --arg host "$fallback_host" --argjson now "$NOW_MS" \
+    '{host:$host, generated_at:$now, degraded:true, unreadable:0, sessions:[]}')
+fi
+
+read -r local_host local_generated_at local_degraded local_unreadable \
+  < <(jq -r '[.host, .generated_at, .degraded, .unreadable] | @tsv' <<<"$local_out")
+[[ -n $local_host ]] || local_host=${CLAUDE_DASH_HOST:-$(uname -n)}
+local_sessions=$(jq -c --arg h "$local_host" \
+  '[ (.sessions // [])[] | . + {host:$h} ]' <<<"$local_out")
+
+# --- remote rows: every cache file, whatever the current hosts list says --
+shopt -s nullglob
+cache_files=("$CACHE_DIR"/*.json)
+shopt -u nullglob
+
+caches='[]'
+invalid_hosts='[]'
+if ((${#cache_files[@]})); then
+  if ! caches=$(jq -c -s '.' "${cache_files[@]}" 2>/dev/null); then
+    # One cache file was unreadable/corrupt JSON, and jq has no partial-batch
+    # mode -- a single bad file fails the whole slurp. Re-check per file
+    # instead, exactly like claude-sessions does for the local registry: one
+    # corrupt remote must cost only that remote, never the whole merge.
+    caches='[]'
+    for f in "${cache_files[@]}"; do
+      if item=$(jq -c '.' "$f" 2>/dev/null); then
+        caches=$(jq -n -c --argjson a "$caches" --argjson b "$item" '$a + [$b]')
+      else
+        base=$(basename "$f" .json)
+        invalid_hosts=$(jq -n -c --argjson a "$invalid_hosts" --arg h "$base" '$a + [$h]')
+      fi
+    done
+  fi
+fi
+
+merged=$(jq -n \
+  --arg local_host "$local_host" --argjson now "$NOW_MS" \
+  --argjson local_generated_at "${local_generated_at:-$NOW_MS}" \
+  --argjson degraded "${local_degraded:-false}" \
+  --argjson unreadable "${local_unreadable:-0}" \
+  --argjson stale_ms "$((STALE_AFTER * 1000))" \
+  --argjson local_sessions "$local_sessions" \
+  --argjson caches "$caches" --argjson invalid_hosts "$invalid_hosts" '
+  def status_of($ok; $fetched_at):
+    if ($ok != true) then "unreachable"
+    elif ($fetched_at == null) then "stale"
+    elif ($now - $fetched_at) < $stale_ms then "fresh"
+    else "stale" end;
+
+  ($caches | map(
+     (.host // "unknown") as $h
+     | { entry: { host: $h, kind: "remote",
+                  fetched_at: (.fetched_at // null),
+                  age_ms: (if .fetched_at then ($now - .fetched_at) else null end),
+                  status: status_of(.ok; .fetched_at),
+                  error: (.error // null) },
+         rows: ((.payload.sessions // []) | map(. + {host: $h})) }
+   )) as $remote
+  | ($invalid_hosts | map({
+       entry: { host: ., kind: "remote", fetched_at: null, age_ms: null,
+                status: "unreachable", error: "corrupt cache" },
+       rows: [] })) as $corrupt
+  | ($remote + $corrupt) as $all
+  | { host: $local_host, generated_at: $now, degraded: $degraded, unreadable: $unreadable,
+      hosts: ([{ host: $local_host, kind: "local", fetched_at: $local_generated_at,
+                  age_ms: 0, status: "fresh", error: null }]
+              + ($all | map(.entry))),
+      sessions: ($local_sessions + ($all | map(.rows) | add // [])) }')
+
+# --- trigger a refresh, never blocking on it --------------------------
+# Only when there is somewhere to fetch from: a fresh install or a plain
+# single-machine setup with no hosts file must cost nothing extra here.
+if [[ -f $HOSTS_FILE ]]; then
+  newest=0
+  for f in "${cache_files[@]}"; do
+    mt=$(stat -c %Y "$f" 2>/dev/null || printf '0')
+    ((mt > newest)) && newest=$mt
+  done
+  now_s=$(date +%s)
+  cache_age=$((now_s - newest))
+  fetch_due=false
+  if ((${#cache_files[@]} == 0)) || ((cache_age > FETCH_EVERY)); then
+    stamp_age=$((FETCH_EVERY + 1))
+    if [[ -f $FETCH_STAMP ]]; then
+      stamp_age=$((now_s - $(stat -c %Y "$FETCH_STAMP" 2>/dev/null || printf '0')))
+    fi
+    ((stamp_age >= FETCH_EVERY)) && fetch_due=true
+  fi
+  if [[ $fetch_due == true ]]; then
+    mkdir -p "$(dirname "$FETCH_STAMP")" 2>/dev/null
+    : >"$FETCH_STAMP" 2>/dev/null
+    if command -v setsid >/dev/null 2>&1; then
+      setsid "$FETCH_BIN" </dev/null >/dev/null 2>&1 &
+    else
+      "$FETCH_BIN" </dev/null >/dev/null 2>&1 &
+    fi
+    disown 2>/dev/null || true
+  fi
+fi
+
+printf '%s\n' "$merged"
