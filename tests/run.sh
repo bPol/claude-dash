@@ -393,6 +393,203 @@ rm -rf "$root"
 
 rm -rf "$stub_dir"
 
+printf '\nclaude-dash-fetch\n'
+
+SSH_STUB=$HERE/stub/ssh
+
+root=$(new_root)
+cache=$root/cache
+hosts=$root/hosts
+mk_hosts_file "$hosts" "ok-host"
+CLAUDE_DASH_HOSTS=$hosts CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_SSH=$SSH_STUB \
+  "$BIN/claude-dash-fetch"
+check "cache file is created for a reachable host" \
+  "$([[ -f $cache/ok-host.json ]] && echo yes || echo no)" "yes"
+check "cache file reports ok:true" \
+  "$(jq -r '.ok' "$cache/ok-host.json")" "true"
+check "cache file carries the remote payload's session" \
+  "$(jq -r '.payload.sessions[0].name' "$cache/ok-host.json")" "remote task"
+check "cache file has no error on success" \
+  "$(jq -r '.error' "$cache/ok-host.json")" "null"
+check "cache file records a numeric fetched_at" \
+  "$(jq -r '.fetched_at | type' "$cache/ok-host.json")" "number"
+check "no stray temp files are left behind (atomic write)" \
+  "$(find "$cache" -maxdepth 1 -name '.ok-host.*' ! -name '.ok-host.lock' | wc -l | tr -d ' ')" "0"
+rm -rf "$root"
+
+root=$(new_root)
+cache=$root/cache
+hosts=$root/hosts
+mk_hosts_file "$hosts" "unreachable-host"
+CLAUDE_DASH_HOSTS=$hosts CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_SSH=$SSH_STUB \
+  "$BIN/claude-dash-fetch"
+check "unreachable host is recorded as not ok" \
+  "$(jq -r '.ok' "$cache/unreachable-host.json")" "false"
+check "unreachable host gets a null payload with no prior cache" \
+  "$(jq -r '.payload' "$cache/unreachable-host.json")" "null"
+check "unreachable host's error mentions the DNS failure" \
+  "$(jq -r '.error | contains("unreachable")' "$cache/unreachable-host.json")" "true"
+rm -rf "$root"
+
+root=$(new_root)
+cache=$root/cache
+hosts=$root/hosts
+mk_hosts_file "$hosts" "authfail-host"
+CLAUDE_DASH_HOSTS=$hosts CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_SSH=$SSH_STUB \
+  "$BIN/claude-dash-fetch"
+check "auth failure is distinguished from a generic unreachable error" \
+  "$(jq -r '.error' "$cache/authfail-host.json")" "auth failed"
+rm -rf "$root"
+
+root=$(new_root)
+cache=$root/cache
+hosts=$root/hosts
+mk_hosts_file "$hosts" "missingcmd-host"
+CLAUDE_DASH_HOSTS=$hosts CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_SSH=$SSH_STUB \
+  "$BIN/claude-dash-fetch"
+check "a remote with no claude-sessions installed is distinguished" \
+  "$(jq -r '.error' "$cache/missingcmd-host.json")" "remote command missing"
+rm -rf "$root"
+
+# A host that answered with garbage (not JSON at all) must not be treated as
+# a successful fetch just because ssh itself exited 0.
+root=$(new_root)
+cache=$root/cache
+hosts=$root/hosts
+mk_hosts_file "$hosts" "badjson-host"
+CLAUDE_DASH_HOSTS=$hosts CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_SSH=$SSH_STUB \
+  "$BIN/claude-dash-fetch"
+check "a non-JSON response from ssh is not treated as ok" \
+  "$(jq -r '.ok' "$cache/badjson-host.json")" "false"
+rm -rf "$root"
+
+# A host that was reachable once and then goes down must keep the LAST
+# successful payload in the cache file, not lose it.
+root=$(new_root)
+cache=$root/cache
+mkdir -p "$cache"
+jq -n '{host:"ok-host",fetched_at:1,ok:true,error:null,
+        payload:{host:"ok-host",generated_at:1,degraded:false,unreadable:0,
+                 sessions:[{"kind":"interactive","pid":9,"name":"last known","cwd":"/x",
+                            "status":"idle","working":false,"state":null,"needs":null,
+                            "idle_ms":1,"job_id":null,"finished":false}]}}' \
+  >"$cache/ok-host.json"
+hosts=$root/hosts
+mk_hosts_file "$hosts" "unreachable-host"
+# Rewrite the fixture to look like ok-host failing this round: reuse the same
+# cache file path by pointing the hosts file at unreachable-host but priming
+# the cache under that same name first.
+mv "$cache/ok-host.json" "$cache/unreachable-host.json"
+CLAUDE_DASH_HOSTS=$hosts CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_SSH=$SSH_STUB \
+  "$BIN/claude-dash-fetch"
+check "a failed refetch is marked not ok" \
+  "$(jq -r '.ok' "$cache/unreachable-host.json")" "false"
+check "a failed refetch preserves the previous payload" \
+  "$(jq -r '.payload.sessions[0].name' "$cache/unreachable-host.json")" "last known"
+check "a failed refetch still records the new error" \
+  "$(jq -r '.error | contains("unreachable")' "$cache/unreachable-host.json")" "true"
+rm -rf "$root"
+
+# --host refreshes exactly the named host, leaving the hosts file (and any
+# other cached host) untouched -- how the other scenarios above are tested
+# in isolation, and how a person debugs one host by hand.
+root=$(new_root)
+cache=$root/cache
+hosts=$root/hosts
+mk_hosts_file "$hosts" "ok-host" "blocked-host"
+CLAUDE_DASH_HOSTS=$hosts CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_SSH=$SSH_STUB \
+  "$BIN/claude-dash-fetch" --host blocked-host
+check "--host fetches only the named host" \
+  "$([[ -f $cache/blocked-host.json ]] && echo yes || echo no)" "yes"
+check "--host does not fetch the other configured hosts" \
+  "$([[ -f $cache/ok-host.json ]] && echo yes || echo no)" "no"
+check "--host works even without a hosts file at all" \
+  "$(CLAUDE_DASH_HOSTS=$root/no-such-file CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_SSH=$SSH_STUB \
+     "$BIN/claude-dash-fetch" --host ok-host; jq -r '.ok' "$cache/ok-host.json")" "true"
+rm -rf "$root"
+
+# user@host normalises to the bare host for both the cache filename and the
+# host field inside it -- the login user must never leak into a label.
+root=$(new_root)
+cache=$root/cache
+hosts=$root/hosts
+mk_hosts_file "$hosts" "deploy@ok-host"
+CLAUDE_DASH_HOSTS=$hosts CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_SSH=$SSH_STUB \
+  "$BIN/claude-dash-fetch"
+check "user@host cache file is named by host only" \
+  "$([[ -f $cache/ok-host.json ]] && echo yes || echo no)" "yes"
+check "user@host's login user is not in the recorded host field" \
+  "$(jq -r '.host' "$cache/ok-host.json")" "ok-host"
+rm -rf "$root"
+
+# Comments and blank lines in the hosts file are ignored, and a genuinely
+# empty/absent hosts file fetches nothing (no error, no cache files).
+root=$(new_root)
+cache=$root/cache
+hosts=$root/hosts
+mk_hosts_file "$hosts" "# a comment" "" "   " "ok-host  " "# trailing comment"
+CLAUDE_DASH_HOSTS=$hosts CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_SSH=$SSH_STUB \
+  "$BIN/claude-dash-fetch"
+check "comments and blank lines are ignored, trailing whitespace trimmed" \
+  "$(find "$cache" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')" "1"
+rm -rf "$root"
+
+root=$(new_root)
+cache=$root/cache
+CLAUDE_DASH_HOSTS=$root/no-such-hosts-file CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_SSH=$SSH_STUB \
+  "$BIN/claude-dash-fetch"
+check "no hosts file at all fetches nothing and does not error" "$?" "0"
+rm -rf "$root"
+
+# Two hosts, one slow: the fast host's cache file must land well before the
+# slow one finishes, proving the fetches ran in parallel rather than serially.
+root=$(new_root)
+cache=$root/cache
+hosts=$root/hosts
+mk_hosts_file "$hosts" "ok-host" "slow-host"
+t0=$(date +%s%N)
+STUB_SSH_SLEEP=2 CLAUDE_DASH_HOSTS=$hosts CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_SSH=$SSH_STUB \
+  "$BIN/claude-dash-fetch" &
+fetch_pid=$!
+# Poll for the fast host's file to appear while the slow one is still running.
+fast_seen_before_slow_done=no
+for _ in $(seq 40); do
+  if [[ -f $cache/ok-host.json ]]; then
+    fast_seen_before_slow_done=yes
+    break
+  fi
+  sleep 0.05
+done
+wait "$fetch_pid"
+t1=$(date +%s%N)
+elapsed_ms=$(((t1 - t0) / 1000000))
+check "the fast host's cache appears before the slow host finishes" \
+  "$fast_seen_before_slow_done" "yes"
+check "one slow host does not double the total runtime (parallel, not serial)" \
+  "$([[ $elapsed_ms -lt 3500 ]] && echo yes || echo no)" "yes"
+rm -rf "$root"
+
+# Two concurrent fetch runs for the same host: the per-host lock must let
+# only one of them actually call ssh, so the loser leaves the winner's write
+# alone instead of racing it.
+root=$(new_root)
+cache=$root/cache
+hosts=$root/hosts
+mk_hosts_file "$hosts" "counted-host"
+ssh_log=$root/ssh-log
+: >"$ssh_log"
+STUB_SSH_SLEEP=1 STUB_SSH_LOG=$ssh_log CLAUDE_DASH_HOSTS=$hosts CLAUDE_DASH_CACHE=$cache \
+  CLAUDE_DASH_SSH=$SSH_STUB "$BIN/claude-dash-fetch" &
+p1=$!
+sleep 0.1   # let the first run grab the lock before the second starts
+STUB_SSH_SLEEP=1 STUB_SSH_LOG=$ssh_log CLAUDE_DASH_HOSTS=$hosts CLAUDE_DASH_CACHE=$cache \
+  CLAUDE_DASH_SSH=$SSH_STUB "$BIN/claude-dash-fetch" &
+p2=$!
+wait "$p1" "$p2"
+check "a concurrent fetch for the same host is skipped, not double-run" \
+  "$(wc -l <"$ssh_log" | tr -d ' ')" "1"
+rm -rf "$root"
+
 printf '\nclaude-dash-badge\n'
 
 producer_stub() {   # producer_stub SESSIONS_JSON -> path to a stub producer

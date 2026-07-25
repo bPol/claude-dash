@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# Refresh the remote session cache: one `ssh ... claude-sessions` per
+# configured host, run in parallel, written atomically so a reader never sees
+# a half-written file. Never on the fast 2s poll path -- claude-sessions-all
+# spawns this fully detached when the cache goes stale and reads whatever is
+# already on disk in the meantime.
+set -uo pipefail
+
+HOSTS_FILE=${CLAUDE_DASH_HOSTS:-$HOME/.config/claude-dash/hosts}
+CACHE_DIR=${CLAUDE_DASH_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/claude-dash}
+CONNECT_TIMEOUT=${CLAUDE_DASH_FETCH_CONNECT_TIMEOUT:-5}
+OVERALL_TIMEOUT=${CLAUDE_DASH_FETCH_TIMEOUT:-10}
+SSH_BIN=${CLAUDE_DASH_SSH:-ssh}
+
+only_host=""
+if [[ ${1:-} == --host ]]; then
+  only_host=${2:-}
+  if [[ -z $only_host ]]; then
+    printf 'claude-dash-fetch: --host requires an argument\n' >&2
+    exit 1
+  fi
+fi
+
+mkdir -p "$CACHE_DIR" 2>/dev/null
+
+# host_of ENTRY -- "user@host" or "host" -> "host". Used for the cache
+# filename and every label shown to the user; the login user never appears.
+host_of() {
+  printf '%s' "${1##*@}"
+}
+
+# read_hosts_file -- one entry per line from $HOSTS_FILE, "#" comments
+# (including trailing) and blank lines ignored, surrounding whitespace
+# trimmed. Prints nothing, successfully, when the file does not exist.
+read_hosts_file() {
+  [[ -f $HOSTS_FILE ]] || return 0
+  local line
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%%#*}
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -n $line ]] && printf '%s\n' "$line"
+  done <"$HOSTS_FILE"
+}
+
+# classify_error RC STDERR -- a short label distinguishing what ssh's exit
+# code and stderr reasonably let us tell apart: unreachable, auth failure,
+# timeout, or a remote command that is not installed.
+classify_error() {
+  local rc=$1 stderr=$2 first
+  if ((rc == 124 || rc == 137)); then
+    printf 'timeout'
+  elif ((rc == 255)); then
+    if [[ $stderr == *"Permission denied"* ]]; then
+      printf 'auth failed'
+    elif [[ $stderr == *"Could not resolve hostname"* || $stderr == *"Name or service not known"* ]]; then
+      printf 'unreachable (dns)'
+    elif [[ $stderr == *"Connection refused"* ]]; then
+      printf 'unreachable (connection refused)'
+    elif [[ $stderr == *"No route to host"* || $stderr == *"Connection timed out"* ]]; then
+      printf 'unreachable'
+    else
+      first=$(head -n1 <<<"$stderr")
+      printf 'ssh error: %s' "${first:-exit $rc}"
+    fi
+  elif ((rc == 127)); then
+    printf 'remote command missing'
+  else
+    first=$(head -n1 <<<"$stderr")
+    if [[ -n $first ]]; then
+      printf 'remote error: %s' "$first"
+    else
+      printf 'remote error (exit %d)' "$rc"
+    fi
+  fi
+}
+
+# fetch_one ENTRY -- refresh exactly one host's cache file. Locked per host
+# (fd 9, in this call's own subshell -- fetch_one always runs backgrounded)
+# so two concurrent claude-dash-fetch runs cannot stampede the same target;
+# whichever loses the race for a host simply skips it, leaving the winner's
+# write in place.
+fetch_one() {
+  local entry=$1 host lockfile outfile tmpfile stderr_file raw rc
+  host=$(host_of "$entry")
+  lockfile="$CACHE_DIR/.$host.lock"
+  outfile="$CACHE_DIR/$host.json"
+
+  exec 9>"$lockfile" 2>/dev/null || return 0
+  if ! flock -n 9; then
+    exec 9>&-
+    return 0
+  fi
+
+  stderr_file=$(mktemp "${TMPDIR:-/tmp}/claude-dash-fetch-err.XXXXXX")
+  local ok=false error_msg='' payload='null' now prev
+  if raw=$(timeout "$OVERALL_TIMEOUT" "$SSH_BIN" \
+        -o BatchMode=yes -o ConnectTimeout="$CONNECT_TIMEOUT" \
+        -o StrictHostKeyChecking=accept-new \
+        "$entry" claude-sessions 2>"$stderr_file"); then
+    if [[ -n $raw ]] && jq -e . >/dev/null 2>&1 <<<"$raw"; then
+      payload=$raw
+      ok=true
+    else
+      error_msg='invalid response'
+    fi
+  else
+    rc=$?
+    error_msg=$(classify_error "$rc" "$(<"$stderr_file")")
+  fi
+  rm -f "$stderr_file"
+
+  if [[ $ok == false && -f $outfile ]]; then
+    # Preserve the previous payload on failure so the board still shows
+    # last-known rows -- marked stale/unreachable by the reader -- rather
+    # than losing them the moment a single poll fails.
+    prev=$(jq -c '.payload' "$outfile" 2>/dev/null) || prev=''
+    [[ -n $prev && $prev != null ]] && payload=$prev
+  fi
+
+  now=$(date +%s%3N)
+  tmpfile=$(mktemp "$CACHE_DIR/.$host.XXXXXX")
+  if jq -n --arg host "$host" --argjson fetched_at "$now" --argjson ok "$ok" \
+        --arg error "$error_msg" --argjson payload "$payload" \
+      '{host:$host, fetched_at:$fetched_at, ok:$ok,
+        error:(if $error == "" then null else $error end), payload:$payload}' \
+      >"$tmpfile" 2>/dev/null; then
+    mv -f "$tmpfile" "$outfile"
+  else
+    rm -f "$tmpfile"
+  fi
+
+  flock -u 9
+  exec 9>&-
+}
+
+hosts=()
+if [[ -n $only_host ]]; then
+  hosts=("$only_host")
+else
+  while IFS= read -r h; do hosts+=("$h"); done < <(read_hosts_file)
+fi
+
+((${#hosts[@]})) || exit 0
+
+pids=()
+for entry in "${hosts[@]}"; do
+  fetch_one "$entry" &
+  pids+=($!)
+done
+for pid in "${pids[@]}"; do
+  wait "$pid" 2>/dev/null || true
+done

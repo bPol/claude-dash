@@ -68,6 +68,15 @@ mk_orphan_job() {
     >"$root/jobs/$id/state.json"
 }
 
+# mk_hosts_file PATH LINE... -- write a claude-dash-fetch hosts file, one
+# LINE per argument (comments/blanks included verbatim, so a test can exercise
+# the parser's own comment/blank handling).
+mk_hosts_file() {
+  local path=$1; shift
+  mkdir -p "$(dirname "$path")"
+  printf '%s\n' "$@" >"$path"
+}
+
 # check DESCRIPTION ACTUAL EXPECTED
 check() {
   TESTS_RUN=$((TESTS_RUN + 1))

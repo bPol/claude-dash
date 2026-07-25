@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Fake ssh for the claude-dash-fetch tests: never touches the network. Its
+# behaviour is keyed off the target entry (the second-to-last argument; the
+# last is always the remote command name), so a test picks a scenario simply
+# by naming its host fixture-appropriately.
+args=("$@")
+n=${#args[@]}
+entry=${args[$((n - 2))]}
+host=${entry##*@}
+
+[[ -n ${STUB_SSH_LOG:-} ]] && printf '%s\n' "$host" >>"$STUB_SSH_LOG"
+
+case "$host" in
+  ok-host)
+    cat <<'JSON'
+{"host":"ok-host","generated_at":1000,"degraded":false,"unreadable":0,"sessions":[{"kind":"interactive","pid":501,"name":"remote task","cwd":"/home/u/x","status":"busy","working":true,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]}
+JSON
+    exit 0
+    ;;
+  blocked-host)
+    cat <<'JSON'
+{"host":"blocked-host","generated_at":1000,"degraded":false,"unreadable":0,"sessions":[{"kind":"bg","pid":null,"name":"remote blocked agent","cwd":"/home/u/y","status":"idle","working":false,"state":"blocked","needs":"answer me","idle_ms":2000,"job_id":"j-remote","finished":false}]}
+JSON
+    exit 0
+    ;;
+  unreachable-host)
+    printf 'ssh: Could not resolve hostname unreachable-host: Name or service not known\n' >&2
+    exit 255
+    ;;
+  authfail-host)
+    printf 'user@authfail-host: Permission denied (publickey).\n' >&2
+    exit 255
+    ;;
+  refused-host)
+    printf 'ssh: connect to host refused-host port 22: Connection refused\n' >&2
+    exit 255
+    ;;
+  missingcmd-host)
+    printf 'bash: line 1: claude-sessions: command not found\n' >&2
+    exit 127
+    ;;
+  badjson-host)
+    printf 'not json at all\n'
+    exit 0
+    ;;
+  slow-host)
+    sleep "${STUB_SSH_SLEEP:-10}"
+    cat <<'JSON'
+{"host":"slow-host","generated_at":1000,"degraded":false,"unreadable":0,"sessions":[]}
+JSON
+    exit 0
+    ;;
+  counted-host)
+    sleep "${STUB_SSH_SLEEP:-1}"
+    cat <<'JSON'
+{"host":"counted-host","generated_at":1000,"degraded":false,"unreadable":0,"sessions":[]}
+JSON
+    exit 0
+    ;;
+  *)
+    printf 'ssh: unknown stub host %s\n' "$host" >&2
+    exit 1
+    ;;
+esac
