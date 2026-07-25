@@ -24,7 +24,8 @@ if ((claude_count > 1)); then
 fi
 
 mkdir -p "$BIN_DIR"
-for script in claude-sessions claude-dash claude-dash-badge claude-dash-toggle; do
+for script in claude-sessions claude-sessions-all claude-dash-fetch \
+              claude-dash claude-dash-badge claude-dash-toggle; do
   ln -sfn "$HERE/bin/$script" "$BIN_DIR/$script"
   printf 'linked %s -> %s\n' "$BIN_DIR/$script" "$HERE/bin/$script"
 done
@@ -33,6 +34,28 @@ case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *) printf '\nWarning: %s is not on PATH.\n' "$BIN_DIR" >&2 ;;
 esac
+
+# The hosts file is how claude-dash-fetch knows what to aggregate. Scaffold
+# it with commented examples only -- never guess a real hostname -- so a
+# fresh install has somewhere to add remotes without hand-creating the
+# directory first, and a re-run never overwrites a file already in use.
+HOSTS_FILE=${CLAUDE_DASH_HOSTS:-$HOME/.config/claude-dash/hosts}
+if [[ ! -f $HOSTS_FILE ]]; then
+  mkdir -p "$(dirname "$HOSTS_FILE")"
+  cat >"$HOSTS_FILE" <<'EOF'
+# claude-dash remote hosts, one per line: "host" or "user@host".
+# Lines starting with # and blank lines are ignored.
+#
+# Each remote needs claude-dash installed (so `claude-sessions` is on its
+# PATH) and key-based SSH from this machine (no password prompt -- fetches
+# run with BatchMode=yes and will just fail otherwise).
+#
+# Examples:
+# workstation
+# deploy@10.0.0.5
+EOF
+  printf 'created %s\n' "$HOSTS_FILE"
+fi
 
 printf '\n--- add to ~/.config/sway/config ---\n\n'
 cat "$HERE/config/sway.conf.snippet"

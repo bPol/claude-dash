@@ -1141,4 +1141,29 @@ log=$(run_toggle absent false)
 check "a live board is never launched twice" \
   "$(printf '%s' "$log" | grep -c '^foot ')" "0"
 
+printf '\ninstall.sh\n'
+
+root=$(new_root)
+bin_dir=$root/bindir
+hosts_file=$root/config/claude-dash/hosts
+CLAUDE_DASH_BIN_DIR=$bin_dir CLAUDE_DASH_HOSTS=$hosts_file PATH="$STUB_BIN:$PATH" \
+  "$HERE/../install.sh" >/dev/null 2>"$root/install-stderr"
+check "install.sh creates the hosts file when absent" \
+  "$([[ -f $hosts_file ]] && echo yes || echo no)" "yes"
+check "the created hosts file has no real host, only comments/blanks" \
+  "$(grep -vc '^#\|^[[:space:]]*$' "$hosts_file")" "0"
+check "install.sh symlinks claude-sessions-all" \
+  "$([[ -L $bin_dir/claude-sessions-all ]] && echo yes || echo no)" "yes"
+check "install.sh symlinks claude-dash-fetch" \
+  "$([[ -L $bin_dir/claude-dash-fetch ]] && echo yes || echo no)" "yes"
+
+# A re-run must not clobber a hosts file the user has since edited with a
+# real host.
+printf 'my-real-host\n' >>"$hosts_file"
+CLAUDE_DASH_BIN_DIR=$bin_dir CLAUDE_DASH_HOSTS=$hosts_file PATH="$STUB_BIN:$PATH" \
+  "$HERE/../install.sh" >/dev/null 2>"$root/install-stderr"
+check "a re-run does not overwrite an existing hosts file" \
+  "$(grep -c 'my-real-host' "$hosts_file")" "1"
+rm -rf "$root"
+
 summary
