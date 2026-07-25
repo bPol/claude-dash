@@ -3,7 +3,7 @@
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-PRODUCER=${CLAUDE_DASH_PRODUCER:-$HERE/claude-sessions}
+PRODUCER=${CLAUDE_DASH_PRODUCER:-$HERE/claude-sessions-all}
 
 fail() {
   printf '{"text":"?","tooltip":%s,"class":"error"}\n' "$(printf '%s' "$1" | jq -Rs .)"
@@ -21,21 +21,48 @@ jq -c -r '
     elif . < 86400000 then "\((. / 3600000 | floor))h"
     else "\((. / 86400000 | floor))d" end;
 
-  (.sessions | map(select(.finished | not))) as $live
+  # Counts are over ALL hosts, local and remote alike -- a blocked agent on a
+  # remote machine turns this badge amber exactly like a local one would.
+  (.host) as $top_host
+  # `.hosts` only exists on claude-sessions-all output; a plain claude-sessions
+  # producer (no remotes configured, or a test stub) has neither `.hosts` nor
+  # a `.host` field on each session, so both default to a single local group
+  # keyed off the top-level `.host` -- this is what keeps single-machine
+  # output identical to before.
+  | (.hosts // [{host:$top_host, kind:"local", fetched_at:.generated_at, age_ms:0, status:"fresh", error:null}]) as $hostlist
+  | (.sessions | map(. + {host: (.host // $top_host)})) as $sess
+  | (.degraded) as $degraded
+  | (.unreadable) as $unreadable
+  | ($sess | map(select(.finished | not))) as $live
   | ($live | map(select(.state == "blocked")) | length) as $blocked
   | ($live | map(select(.working and .state != "blocked")) | length) as $busy
   | ($live | map(select((.working | not) and .state != "blocked")) | length) as $idle
-  | ((.sessions | map(select(.finished)) | length)) as $done
-  | ((.sessions | length) == 0 and .unreadable > 0) as $blind
+  | (($sess | length) == 0 and .unreadable > 0) as $blind
+  | ($hostlist | map(
+      . as $hd
+      | ($sess | map(select(.host == $hd.host))) as $rows
+      | ($rows | map(select(.finished | not))) as $hlive
+      | ($rows | map(select(.finished)) | length) as $hdone
+      | ( [ $hd.host
+            + (if $hd.kind == "local" then
+                 (if $degraded then "  ⚠ degraded (CLI fallback)" else "" end)
+                 + (if $unreadable > 0 then "  ⚠ \($unreadable) unreadable" else "" end)
+               else
+                 (if $hd.status == "unreachable" then
+                    "  unreachable" + (if $hd.error then ": \($hd.error)" else "" end)
+                  elif $hd.status == "stale" then
+                    "  (\($hd.age_ms | age) ago)"
+                  else "" end)
+               end) ]
+          + ($hlive | map("\(.state // .status)\t\(.name)\t\(.idle_ms | age)"))
+          + (if $hdone > 0 then ["\($hdone) finished"] else [] end)
+        )
+    )) as $groups
   | {
       text: (if $blind then "?" else "\($busy)▸\($blocked)▸\($idle)" end),
       class: (if $blind then "error"
               elif $blocked > 0 then "alert"
               elif $busy > 0 then "active"
               else "quiet" end),
-      tooltip: ([ .host + (if .degraded then "  ⚠ degraded (CLI fallback)" else "" end)
-                        + (if .unreadable > 0 then "  ⚠ \(.unreadable) unreadable" else "" end) ]
-                + ($live | map("\(.state // .status)\t\(.name)\t\(.idle_ms | age)"))
-                + (if $done > 0 then ["\($done) finished"] else [] end)
-                | join("\n"))
+      tooltip: ($groups | flatten | join("\n"))
     }' <<<"$data" 2>/dev/null || fail "claude-dash: could not parse producer output"

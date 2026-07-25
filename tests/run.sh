@@ -852,6 +852,56 @@ check "a row that is both working and blocked counts once, as blocked" \
   "$(jq -r '.text' <<<"$out")" "1▸1▸1"
 rm -rf "$(dirname "$p")"
 
+printf '\nclaude-dash-badge: multi-host (claude-sessions-all shaped output)\n'
+
+multi_producer_stub() {   # multi_producer_stub HOSTS_JSON SESSIONS_JSON -> path
+  local d
+  d=$(mktemp -d "${TMPDIR:-/tmp}/claude-dash-multiprod.XXXXXX")
+  { printf '#!/usr/bin/env bash\ncat <<'"'"'JSON'"'"'\n'
+    jq -n --argjson h "$1" --argjson s "$2" \
+      '{host:"local-box",generated_at:0,degraded:false,unreadable:0,hosts:$h,sessions:$s}'
+    printf 'JSON\n'
+  } >"$d/producer"
+  chmod +x "$d/producer"
+  printf '%s' "$d/producer"
+}
+
+# A blocked agent on a REMOTE host must turn the badge amber, exactly like a
+# local one -- counts are over every host in the merged producer's output.
+p=$(multi_producer_stub \
+  '[{"host":"local-box","kind":"local","fetched_at":0,"age_ms":0,"status":"fresh","error":null},
+    {"host":"worker-pc","kind":"remote","fetched_at":0,"age_ms":1000,"status":"fresh","error":null}]' \
+  '[{"kind":"interactive","pid":1,"name":"local idle","cwd":"/x","status":"idle","working":false,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false,"host":"local-box"},
+    {"kind":"bg","pid":null,"name":"remote blocked agent","cwd":"/y","status":"idle","working":false,"state":"blocked","needs":"answer me","idle_ms":2000,"job_id":"j1","finished":false,"host":"worker-pc"}]')
+out=$(CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash-badge")
+check "a remote blocked agent sets the alert (amber) class" \
+  "$(jq -r '.class' <<<"$out")" "alert"
+check "a remote blocked agent is counted in the badge text" \
+  "$(jq -r '.text' <<<"$out")" "0▸1▸1"
+check "tooltip groups the remote row under its own host heading" \
+  "$(jq -r '.tooltip | contains("worker-pc")' <<<"$out")" "true"
+check "tooltip mentions the remote blocked agent" \
+  "$(jq -r '.tooltip | contains("remote blocked agent")' <<<"$out")" "true"
+rm -rf "$(dirname "$p")"
+
+# A stale remote host heading shows a relative age; an unreachable one shows
+# "unreachable" with its error, and its rows (last-known) still appear.
+p=$(multi_producer_stub \
+  '[{"host":"local-box","kind":"local","fetched_at":0,"age_ms":0,"status":"fresh","error":null},
+    {"host":"stale-pc","kind":"remote","fetched_at":0,"age_ms":180000,"status":"stale","error":null},
+    {"host":"down-pc","kind":"remote","fetched_at":0,"age_ms":600000,"status":"unreachable","error":"unreachable (dns)"}]' \
+  '[{"kind":"interactive","pid":1,"name":"last known on down-pc","cwd":"/y","status":"idle","working":false,"state":null,"needs":null,"idle_ms":600000,"job_id":null,"finished":false,"host":"down-pc"}]')
+out=$(CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash-badge")
+check "a stale remote's heading shows a relative age" \
+  "$(jq -r '.tooltip | contains("stale-pc") and contains("3m ago")' <<<"$out")" "true"
+check "an unreachable remote's heading shows the word unreachable" \
+  "$(jq -r '.tooltip | contains("down-pc") and contains("unreachable")' <<<"$out")" "true"
+check "an unreachable remote's heading shows its error" \
+  "$(jq -r '.tooltip | contains("unreachable (dns)")' <<<"$out")" "true"
+check "an unreachable remote still shows its last-known row" \
+  "$(jq -r '.tooltip | contains("last known on down-pc")' <<<"$out")" "true"
+rm -rf "$(dirname "$p")"
+
 printf '\nclaude-dash board\n'
 
 p=$(producer_stub '[
@@ -928,6 +978,54 @@ frames=$(COLUMNS=100 CLAUDE_DASH_PRODUCER=$p CLAUDE_DASH_INTERVAL=1 \
          timeout 2 "$BIN/claude-dash" </dev/null 2>/dev/null | tr -cd 'q' | wc -c)
 check "non-tty loop sleeps instead of spinning" \
   "$([[ $frames -lt 50 ]] && echo bounded || echo spinning)" "bounded"
+rm -rf "$(dirname "$p")"
+
+printf '\nclaude-dash board: multi-host (claude-sessions-all shaped output)\n'
+
+p=$(multi_producer_stub \
+  '[{"host":"local-box","kind":"local","fetched_at":0,"age_ms":0,"status":"fresh","error":null},
+    {"host":"worker-pc","kind":"remote","fetched_at":0,"age_ms":1000,"status":"fresh","error":null},
+    {"host":"stale-pc","kind":"remote","fetched_at":0,"age_ms":180000,"status":"stale","error":null},
+    {"host":"down-pc","kind":"remote","fetched_at":0,"age_ms":600000,"status":"unreachable","error":"unreachable (dns)"}]' \
+  '[{"kind":"interactive","pid":1,"name":"local task","cwd":"/x","status":"busy","working":true,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false,"host":"local-box"},
+    {"kind":"bg","pid":null,"name":"remote blocked agent","cwd":"/y","status":"idle","working":false,"state":"blocked","needs":"answer me","idle_ms":2000,"job_id":"j1","finished":false,"host":"worker-pc"},
+    {"kind":"interactive","pid":null,"name":"stale remote row","cwd":"/z","status":"idle","working":false,"state":null,"needs":null,"idle_ms":180000,"job_id":null,"finished":false,"host":"stale-pc"},
+    {"kind":"interactive","pid":null,"name":"last known on down-pc","cwd":"/w","status":"idle","working":false,"state":null,"needs":null,"idle_ms":600000,"job_id":null,"finished":false,"host":"down-pc"}]')
+frame=$(COLUMNS=100 CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash" --once)
+check "top header still names the local host" \
+  "$(grep -c 'claude sessions · local-box' <<<"$frame")" "1"
+check "local block has no host heading of its own" \
+  "$(grep -c '^ local-box' <<<"$frame")" "0"
+check "a fresh remote host gets its own block heading" \
+  "$(grep -c '^ worker-pc' <<<"$frame")" "1"
+check "the remote block's row is shown" \
+  "$(grep -c 'remote blocked agent' <<<"$frame")" "1"
+check "a stale remote host's heading shows a relative age" \
+  "$(grep -c '^ stale-pc.*ago' <<<"$frame")" "1"
+check "a stale remote's last-known row still shows" \
+  "$(grep -c 'stale remote row' <<<"$frame")" "1"
+check "an unreachable remote host's heading says unreachable with its error" \
+  "$(grep -c '^ down-pc.*unreachable: unreachable (dns)' <<<"$frame")" "1"
+check "an unreachable remote's last-known row still shows" \
+  "$(grep -c 'last known on down-pc' <<<"$frame")" "1"
+check "counts sum across every host, not just local" \
+  "$(grep -oE '[0-9]+ busy · [0-9]+ blocked · [0-9]+ idle' <<<"$frame" \
+     | grep -oE '[0-9]+' | awk '{s+=$1} END{print s+0}')" "4"
+check "multi-host frame still respects the terminal width" \
+  "$(awk 'length > 100' <<<"$frame" | wc -l)" "0"
+rm -rf "$(dirname "$p")"
+
+# A single-host claude-sessions-all-shaped producer (a real remote-configured
+# setup where nothing else is remote yet) must render exactly like the plain
+# local board: no remote block, just the local rows.
+p=$(multi_producer_stub \
+  '[{"host":"local-box","kind":"local","fetched_at":0,"age_ms":0,"status":"fresh","error":null}]' \
+  '[{"kind":"interactive","pid":1,"name":"only local","cwd":"/x","status":"busy","working":true,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false,"host":"local-box"}]')
+frame=$(COLUMNS=100 CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash" --once)
+check "a one-entry hosts array renders with no remote block at all" \
+  "$(grep -cE '^ [a-z-]+-pc|^ local-box' <<<"$frame")" "0"
+check "the sole local row still shows" \
+  "$(grep -c 'only local' <<<"$frame")" "1"
 rm -rf "$(dirname "$p")"
 
 printf '\nclaude-dash: pidfile cleanup with multiple instances\n'
