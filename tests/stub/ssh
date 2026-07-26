@@ -59,6 +59,18 @@ JSON
     printf '{"host":"wrongshape2-host","generated_at":1000,"degraded":false,"unreadable":0,"sessions":"nope"}\n'
     exit 0
     ;;
+  badtype-host)
+    # Valid JSON, right shape (an array of objects), but a field the merge
+    # later gsubs on (.name) is a number, not a string. Type confusion, not
+    # shape confusion -- must be rejected exactly like a shape mismatch.
+    printf '{"host":"badtype-host","generated_at":1000,"degraded":false,"unreadable":0,"sessions":[{"kind":"bg","pid":null,"name":123,"cwd":"/y","status":"idle","working":false,"state":null,"needs":null,"idle_ms":1,"job_id":null,"finished":false}]}\n'
+    exit 0
+    ;;
+  badtype2-host)
+    # Same idea: .needs is an array instead of a string-or-null.
+    printf '{"host":"badtype2-host","generated_at":1000,"degraded":false,"unreadable":0,"sessions":[{"kind":"bg","pid":null,"name":"ok","cwd":"/y","status":"idle","working":false,"state":null,"needs":[],"idle_ms":1,"job_id":null,"finished":false}]}\n'
+    exit 0
+    ;;
   huge-host)
     # ~5MB response: well past any sane per-host contribution. Valid JSON,
     # right shape -- rejected purely on size.

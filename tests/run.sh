@@ -575,6 +575,49 @@ check "a response whose .sessions is a string, not an array, is not treated as o
   "$(jq -r '.ok' "$cache/wrongshape2-host.json")" "false"
 rm -rf "$root"
 
+# Second review, finding 1: shape alone is not enough -- a session object can
+# have the right SHAPE (an object, in an array) while a field the merge later
+# gsubs on carries the wrong TYPE. This must be caught here too, not just
+# surviving downstream by luck: an obviously wrong-typed payload should be
+# recorded as an error, never cached ok:true.
+root=$(new_root)
+cache=$root/cache
+hosts=$root/hosts
+mk_hosts_file "$hosts" "badtype-host"
+CLAUDE_DASH_HOSTS=$hosts CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_SSH=$SSH_STUB \
+  "$BIN/claude-dash-fetch"
+check "a response with a numeric .name is not treated as ok" \
+  "$(jq -r '.ok' "$cache/badtype-host.json")" "false"
+check "a response with a numeric .name is not cached as the payload" \
+  "$(jq -r '.payload' "$cache/badtype-host.json")" "null"
+rm -rf "$root"
+
+root=$(new_root)
+cache=$root/cache
+hosts=$root/hosts
+mk_hosts_file "$hosts" "badtype2-host"
+CLAUDE_DASH_HOSTS=$hosts CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_SSH=$SSH_STUB \
+  "$BIN/claude-dash-fetch"
+check "a response with an array .needs is not treated as ok" \
+  "$(jq -r '.ok' "$cache/badtype2-host.json")" "false"
+rm -rf "$root"
+
+# End-to-end: a rejected badtype-host must still let the board render off
+# local rows -- rejection at the fetch validator means an empty cache entry,
+# never a payload that could reach the merge's clean/stringify path at all.
+root=$(new_root)
+cache=$root/cache
+hosts=$root/hosts
+mk_hosts_file "$hosts" "badtype-host"
+CLAUDE_DASH_HOSTS=$hosts CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_SSH=$SSH_STUB \
+  "$BIN/claude-dash-fetch"
+lp=$(producer_stub '[{"kind":"interactive","pid":1,"name":"local survives badtype fetch","cwd":"/x","status":"busy","working":true,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
+out=$(CLAUDE_DASH_LOCAL_PRODUCER=$lp CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_HOSTS=$root/no-hosts \
+      "$BIN/claude-sessions-all")
+check "end-to-end: a rejected badtype-host still lets the board render" \
+  "$(jq -r '[.sessions[] | select(.name == "local survives badtype fetch")] | length' <<<"$out")" "1"
+rm -rf "$(dirname "$lp")" "$root"
+
 # A host that was reachable once and then goes down must keep the LAST
 # successful payload in the cache file, not lose it.
 root=$(new_root)

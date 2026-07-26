@@ -17,16 +17,31 @@ SSH_BIN=${CLAUDE_DASH_SSH:-ssh}
 # the cap is treated as a failure with an explicit error, same as any other
 # unreachable/invalid response.
 MAX_PAYLOAD_BYTES=${CLAUDE_DASH_MAX_PAYLOAD_BYTES:-1048576}
-# Shape check for a remote response, run before it is ever trusted enough to
-# cache as ok:true: must be a JSON object, and if `.sessions` is present it
-# must be an array of objects -- not an array of scalars, not a string, not
-# an object. Order matters: each `and` only reaches its right side once the
-# left side has already narrowed the type, so this never raises a jq type
-# error on the wrong shape (jq's `and`/`or` short-circuit).
+# Shape AND type check for a remote response, run before it is ever trusted
+# enough to cache as ok:true: must be a JSON object, and if `.sessions` is
+# present it must be an array of objects -- not an array of scalars, not a
+# string, not an object. A shape-only check is not enough, though: a session
+# object can have the right SHAPE while a field the merge later gsubs on
+# (name/cwd/needs/status/state) carries the wrong TYPE -- a number, an array,
+# an object -- so those are checked too, each required to be a string or
+# (where the field is nullable) null. This is a best-effort, "obviously
+# wrong" gate, not exhaustive: claude-sessions-all own merge still coerces
+# any type safely regardless, since a cache file can also be written by an
+# older/buggy fetch that never ran this check at all. Order matters: each
+# `and` only reaches its right side once the left side has already narrowed
+# the type, so this never raises a jq type error on the wrong shape (jq
+# `and`/`or` short-circuit).
 PAYLOAD_SHAPE_OK='
   (type == "object")
   and ((.sessions // []) | type == "array")
-  and ((.sessions // []) | all(type == "object"))
+  and ((.sessions // []) | all(
+        type == "object"
+        and ((.name  // null) == null or (.name  | type) == "string")
+        and ((.cwd   // null) == null or (.cwd   | type) == "string")
+        and ((.needs // null) == null or (.needs | type) == "string")
+        and ((.status// null) == null or (.status| type) == "string")
+        and ((.state // null) == null or (.state | type) == "string")
+      ))
 '
 # The remote's non-interactive PATH is minimal (no ~/.local/bin), so an
 # explicit command is required -- see README's "Aggregating other machines".
