@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fake ssh for the claude-dash-fetch tests: never touches the network. Its
 # behaviour is keyed off the target entry (the second-to-last argument; the
-# last is always the remote command name), so a test picks a scenario simply
+# last is always the remote command), so a test picks a scenario simply
 # by naming its host fixture-appropriately.
 args=("$@")
 n=${#args[@]}
@@ -9,6 +9,10 @@ entry=${args[$((n - 2))]}
 host=${entry##*@}
 
 [[ -n ${STUB_SSH_LOG:-} ]] && printf '%s\n' "$host" >>"$STUB_SSH_LOG"
+# STUB_SSH_CMDLOG records the exact argv the stub was invoked with, one line
+# per call, so a test can assert on the literal remote command string (e.g.
+# that a tilde reached ssh unexpanded, meant for the REMOTE shell to expand).
+[[ -n ${STUB_SSH_CMDLOG:-} ]] && printf '%s\n' "${args[*]}" >>"$STUB_SSH_CMDLOG"
 
 case "$host" in
   ok-host)

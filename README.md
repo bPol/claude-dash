@@ -19,6 +19,20 @@ cd ~/projects/claude-dash && ./install.sh
 does not already exist, and prints the sway, waybar and CSS blocks to paste.
 Then `swaymsg reload`.
 
+A machine that only *contributes* sessions to some other, controlling
+machine's board -- a headless remote with no desktop -- doesn't need any of
+that. Run:
+
+```sh
+./install.sh --producer-only   # or: --remote
+```
+
+This needs only `bash` and `jq`, symlinks just `claude-sessions`, and prints
+no sway/waybar/CSS blocks -- instead it prints the one line to add to the
+*controlling* machine's hosts file to pull from this one. If the full install
+fails because `foot`, `swaymsg` or `waybar` are missing, it tells you to use
+`--producer-only` instead.
+
 ## The six scripts
 
 | Script | Job |
@@ -33,7 +47,8 @@ Then `swaymsg reload`.
 ## Aggregating other machines
 
 List remote hosts, one per line, in `~/.config/claude-dash/hosts`
-(`host` or `user@host`; `#` comments and blank lines ignored):
+(`host` or `user@host`, optionally with `=<remote_cmd>` appended — see below;
+`#` comments and blank lines ignored):
 
 ```
 # workstation
@@ -42,11 +57,34 @@ List remote hosts, one per line, in `~/.config/claude-dash/hosts`
 
 Each listed remote needs:
 
-- **claude-dash installed** there too, so `claude-sessions` is on its `PATH`
-  (run `install.sh` there as well, or symlink just that one script).
+- **claude-sessions installed** there — `./install.sh --producer-only` on that
+  machine is enough; it needs no desktop.
 - **key-based SSH** from this machine, with no passphrase prompt — fetches run
   with `ssh -o BatchMode=yes`, so anything that would prompt just fails and is
   reported as `auth failed` instead.
+
+`claude-dash-fetch` never relies on the remote's `PATH`: a non-interactive SSH
+session's `PATH` is minimal (typically no `~/.local/bin`), so it runs an
+explicit remote command instead of a bare `claude-sessions`. The default is:
+
+```
+~/.local/bin/claude-sessions
+```
+
+(the tilde is expanded by the *remote* shell, against the remote user's own
+home — not by this machine). Override it two ways:
+
+- **globally**, with `$CLAUDE_DASH_REMOTE_CMD`, applied to every host that
+  doesn't specify its own;
+- **per host**, by appending `=<remote_cmd>` to that host's line in the hosts
+  file — this wins over the global override for that host only. `host` and
+  `user@host` keep working unchanged; only the login-user/host part before
+  `=` is used as the ssh target and the display label.
+
+```
+# workstation
+# deploy@10.0.0.5=/opt/claude-dash/bin/claude-sessions
+```
 
 With hosts configured, `claude-sessions-all` notices when its cache is older
 than `CLAUDE_DASH_FETCH_EVERY` seconds and spawns `claude-dash-fetch` fully
@@ -61,7 +99,7 @@ Each host in the board/badge output carries a status:
 |---|---|
 | `fresh` | Cached within `CLAUDE_DASH_STALE_AFTER` seconds (default 45s). Local is always `fresh`. |
 | `stale` | The cache is older than that, but its rows still show — the last thing that host reported. |
-| `unreachable` | The last fetch failed (unreachable, `auth failed`, `timeout`, or `remote command missing`). Its heading shows the error; its rows still show the last successful payload, if there ever was one. |
+| `unreachable` | The last fetch failed (unreachable, `auth failed`, `timeout`, or `remote <cmd> not found`). Its heading shows the error; its rows still show the last successful payload, if there ever was one. |
 
 With no hosts file and no remote cache, `claude-sessions-all` degrades
 transparently to plain `claude-sessions` output plus a `host` field and a
@@ -92,11 +130,12 @@ one-entry `hosts` array — a single-machine setup is unchanged.
 | `CLAUDE_DASH_FETCH_CONNECT_TIMEOUT` | `5` | ssh `ConnectTimeout` per host. |
 | `CLAUDE_DASH_FETCH_TIMEOUT` | `10` | Overall wall-clock timeout per host fetch (connect + remote command). |
 | `CLAUDE_DASH_SSH` | `ssh` | ssh binary `claude-dash-fetch` calls. Override with a stub to test. |
+| `CLAUDE_DASH_REMOTE_CMD` | `~/.local/bin/claude-sessions` | Remote command `claude-dash-fetch` runs over ssh, for every host that has no per-host `=<remote_cmd>` override in the hosts file. |
 
 ## Tests
 
 ```sh
-./tests/run.sh          # 183 checks, no sway, network or Claude Code session required
+./tests/run.sh          # 204 checks, no sway, network or Claude Code session required
 shellcheck -x bin/* install.sh tests/*.sh
 ```
 

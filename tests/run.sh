@@ -458,8 +458,84 @@ hosts=$root/hosts
 mk_hosts_file "$hosts" "missingcmd-host"
 CLAUDE_DASH_HOSTS=$hosts CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_SSH=$SSH_STUB \
   "$BIN/claude-dash-fetch"
-check "a remote with no claude-sessions installed is distinguished" \
-  "$(jq -r '.error' "$cache/missingcmd-host.json")" "remote command missing"
+check "a remote with no claude-sessions installed names the missing command" \
+  "$(jq -r '.error' "$cache/missingcmd-host.json")" "remote claude-sessions not found"
+rm -rf "$root"
+
+# The default remote command is ~/.local/bin/claude-sessions, and the tilde
+# must reach ssh unexpanded -- it is the REMOTE shell's job to expand it
+# against the remote user's home, not this machine's.
+root=$(new_root)
+cache=$root/cache
+hosts=$root/hosts
+cmdlog=$root/ssh-cmdlog
+: >"$cmdlog"
+mk_hosts_file "$hosts" "ok-host"
+CLAUDE_DASH_HOSTS=$hosts CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_SSH=$SSH_STUB \
+  STUB_SSH_CMDLOG=$cmdlog "$BIN/claude-dash-fetch"
+# shellcheck disable=SC2088 # tilde deliberately unexpanded: asserting the literal string claude-dash-fetch passed to ssh
+check "a default host entry runs the ~/.local/bin default, tilde unexpanded" \
+  "$(awk '{print $NF}' "$cmdlog")" '~/.local/bin/claude-sessions'
+rm -rf "$root"
+
+# A per-host override in the hosts file (host=remote_cmd) replaces the
+# default for that host only.
+root=$(new_root)
+cache=$root/cache
+hosts=$root/hosts
+cmdlog=$root/ssh-cmdlog
+: >"$cmdlog"
+mk_hosts_file "$hosts" "ok-host=/opt/claude/bin/claude-sessions"
+CLAUDE_DASH_HOSTS=$hosts CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_SSH=$SSH_STUB \
+  STUB_SSH_CMDLOG=$cmdlog "$BIN/claude-dash-fetch"
+check "a per-host remote command override produces that exact command" \
+  "$(awk '{print $NF}' "$cmdlog")" "/opt/claude/bin/claude-sessions"
+check "the per-host override syntax does not corrupt the cache filename" \
+  "$([[ -f $cache/ok-host.json ]] && echo yes || echo no)" "yes"
+check "a per-host override still fetches successfully" \
+  "$(jq -r '.ok' "$cache/ok-host.json")" "true"
+rm -rf "$root"
+
+# CLAUDE_DASH_REMOTE_CMD overrides the default globally, for every host that
+# does not itself carry a per-host override.
+root=$(new_root)
+cache=$root/cache
+hosts=$root/hosts
+cmdlog=$root/ssh-cmdlog
+: >"$cmdlog"
+mk_hosts_file "$hosts" "ok-host"
+CLAUDE_DASH_HOSTS=$hosts CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_SSH=$SSH_STUB \
+  CLAUDE_DASH_REMOTE_CMD=/usr/local/bin/claude-sessions STUB_SSH_CMDLOG=$cmdlog \
+  "$BIN/claude-dash-fetch"
+check "CLAUDE_DASH_REMOTE_CMD overrides the default for a plain host entry" \
+  "$(awk '{print $NF}' "$cmdlog")" "/usr/local/bin/claude-sessions"
+rm -rf "$root"
+
+# A per-host override wins over the global CLAUDE_DASH_REMOTE_CMD env var.
+root=$(new_root)
+cache=$root/cache
+hosts=$root/hosts
+cmdlog=$root/ssh-cmdlog
+: >"$cmdlog"
+mk_hosts_file "$hosts" "ok-host=/opt/claude/bin/claude-sessions"
+CLAUDE_DASH_HOSTS=$hosts CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_SSH=$SSH_STUB \
+  CLAUDE_DASH_REMOTE_CMD=/usr/local/bin/claude-sessions STUB_SSH_CMDLOG=$cmdlog \
+  "$BIN/claude-dash-fetch"
+check "a per-host override takes precedence over CLAUDE_DASH_REMOTE_CMD" \
+  "$(awk '{print $NF}' "$cmdlog")" "/opt/claude/bin/claude-sessions"
+rm -rf "$root"
+
+# The "command not found" message names whatever remote command was actually
+# attempted, not just the default -- so a custom per-host command that is
+# missing is just as legible.
+root=$(new_root)
+cache=$root/cache
+hosts=$root/hosts
+mk_hosts_file "$hosts" "missingcmd-host=/opt/bin/claude-sessions-x"
+CLAUDE_DASH_HOSTS=$hosts CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_SSH=$SSH_STUB \
+  "$BIN/claude-dash-fetch"
+check "a missing custom remote command is named specifically too" \
+  "$(jq -r '.error' "$cache/missingcmd-host.json")" "remote claude-sessions-x not found"
 rm -rf "$root"
 
 # A host that answered with garbage (not JSON at all) must not be treated as
@@ -1147,7 +1223,7 @@ root=$(new_root)
 bin_dir=$root/bindir
 hosts_file=$root/config/claude-dash/hosts
 CLAUDE_DASH_BIN_DIR=$bin_dir CLAUDE_DASH_HOSTS=$hosts_file PATH="$STUB_BIN:$PATH" \
-  "$HERE/../install.sh" >/dev/null 2>"$root/install-stderr"
+  "$HERE/../install.sh" >"$root/install-stdout" 2>"$root/install-stderr"
 check "install.sh creates the hosts file when absent" \
   "$([[ -f $hosts_file ]] && echo yes || echo no)" "yes"
 check "the created hosts file has no real host, only comments/blanks" \
@@ -1156,6 +1232,12 @@ check "install.sh symlinks claude-sessions-all" \
   "$([[ -L $bin_dir/claude-sessions-all ]] && echo yes || echo no)" "yes"
 check "install.sh symlinks claude-dash-fetch" \
   "$([[ -L $bin_dir/claude-dash-fetch ]] && echo yes || echo no)" "yes"
+check "full install prints the sway config block" \
+  "$(grep -c 'add to ~/.config/sway/config' "$root/install-stdout")" "1"
+check "full install prints the waybar module block" \
+  "$(grep -c 'add to ~/.config/waybar/config.jsonc' "$root/install-stdout")" "1"
+check "full install prints the waybar CSS block" \
+  "$(grep -c 'add to ~/.config/waybar/style.css' "$root/install-stdout")" "1"
 
 # A re-run must not clobber a hosts file the user has since edited with a
 # real host.
@@ -1165,5 +1247,54 @@ CLAUDE_DASH_BIN_DIR=$bin_dir CLAUDE_DASH_HOSTS=$hosts_file PATH="$STUB_BIN:$PATH
 check "a re-run does not overwrite an existing hosts file" \
   "$(grep -c 'my-real-host' "$hosts_file")" "1"
 rm -rf "$root"
+
+# A minimal PATH carrying bash, jq and the handful of coreutils install.sh
+# itself needs to run at all -- but deliberately no foot, swaymsg, waybar or
+# flock -- models the real buildbox remote: no desktop at all.
+min_path_dir=$(mktemp -d "${TMPDIR:-/tmp}/claude-dash-minpath.XXXXXX")
+for tool in bash jq cat dirname ln mkdir sed sort uname wc; do
+  ln -s "$(command -v "$tool")" "$min_path_dir/$tool"
+done
+
+root=$(new_root)
+bin_dir=$root/bindir
+hosts_file=$root/config/claude-dash/hosts
+CLAUDE_DASH_BIN_DIR=$bin_dir CLAUDE_DASH_HOSTS=$hosts_file PATH="$min_path_dir" \
+  "$HERE/../install.sh" >"$root/install-stdout" 2>"$root/install-stderr"; rc=$?
+check "full install on a headless remote fails (missing foot/swaymsg/waybar/flock)" \
+  "$([[ $rc -ne 0 ]] && echo nonzero || echo zero)" "nonzero"
+check "the failure points the user at --producer-only" \
+  "$(grep -c -- '--producer-only' "$root/install-stderr")" "1"
+rm -rf "$root"
+
+root=$(new_root)
+bin_dir=$root/bindir
+hosts_file=$root/config/claude-dash/hosts
+CLAUDE_DASH_BIN_DIR=$bin_dir CLAUDE_DASH_HOSTS=$hosts_file PATH="$min_path_dir" \
+  "$HERE/../install.sh" --producer-only >"$root/install-stdout" 2>"$root/install-stderr"; rc=$?
+check "producer-only install succeeds on bash+jq alone" "$rc" "0"
+check "producer-only install links claude-sessions" \
+  "$([[ -L $bin_dir/claude-sessions ]] && echo yes || echo no)" "yes"
+check "producer-only install links nothing else" \
+  "$(find "$bin_dir" -mindepth 1 | wc -l | tr -d ' ')" "1"
+check "producer-only install prints no waybar block" \
+  "$(grep -c waybar "$root/install-stdout")" "0"
+check "producer-only install prints no sway block" \
+  "$(grep -c 'sway/config' "$root/install-stdout")" "0"
+check "producer-only install does not create the aggregator's hosts file" \
+  "$([[ -f $hosts_file ]] && echo yes || echo no)" "no"
+check "producer-only install notes what to add on the controlling machine" \
+  "$(grep -c 'controlling machine' "$root/install-stdout")" "1"
+rm -rf "$root"
+
+# --remote is an accepted alias for --producer-only.
+root=$(new_root)
+bin_dir=$root/bindir
+CLAUDE_DASH_BIN_DIR=$bin_dir CLAUDE_DASH_HOSTS=$root/config/claude-dash/hosts PATH="$min_path_dir" \
+  "$HERE/../install.sh" --remote >/dev/null 2>"$root/install-stderr"; rc=$?
+check "--remote is accepted as an alias for --producer-only" "$rc" "0"
+check "--remote also links only claude-sessions" \
+  "$([[ -L $bin_dir/claude-sessions ]] && echo yes || echo no)" "yes"
+rm -rf "$root" "$min_path_dir"
 
 summary

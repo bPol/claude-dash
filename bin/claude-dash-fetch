@@ -11,6 +11,13 @@ CACHE_DIR=${CLAUDE_DASH_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/claude-dash}
 CONNECT_TIMEOUT=${CLAUDE_DASH_FETCH_CONNECT_TIMEOUT:-5}
 OVERALL_TIMEOUT=${CLAUDE_DASH_FETCH_TIMEOUT:-10}
 SSH_BIN=${CLAUDE_DASH_SSH:-ssh}
+# The remote's non-interactive PATH is minimal (no ~/.local/bin), so an
+# explicit command is required -- see README's "Aggregating other machines".
+# The tilde below is deliberately unexpanded HERE: it is passed through to
+# the remote shell, which expands it against the remote user's own home.
+# shellcheck disable=SC2088 # tilde deliberately unexpanded: the REMOTE shell expands it, not this one
+DEFAULT_REMOTE_CMD='~/.local/bin/claude-sessions'
+REMOTE_CMD_DEFAULT=${CLAUDE_DASH_REMOTE_CMD:-$DEFAULT_REMOTE_CMD}
 
 only_host=""
 if [[ ${1:-} == --host ]]; then
@@ -23,10 +30,30 @@ fi
 
 mkdir -p "$CACHE_DIR" 2>/dev/null
 
-# host_of ENTRY -- "user@host" or "host" -> "host". Used for the cache
-# filename and every label shown to the user; the login user never appears.
+# A hosts-file entry is "[user@]host[=remote_cmd]" -- the "=remote_cmd" tail
+# is an optional per-host override of the command run over ssh, for a remote
+# whose claude-sessions lives somewhere other than the default. "=" is safe
+# as the delimiter: it cannot appear in a hostname or username.
+
+# target_of ENTRY -- the "[user@]host" ssh target, with any "=remote_cmd"
+# tail stripped.
+target_of() {
+  printf '%s' "${1%%=*}"
+}
+
+# host_of ENTRY -- "user@host[=cmd]" or "host[=cmd]" -> "host". Used for the
+# cache filename and every label shown to the user; the login user never
+# appears.
 host_of() {
-  printf '%s' "${1##*@}"
+  local target
+  target=$(target_of "$1")
+  printf '%s' "${target##*@}"
+}
+
+# remote_cmd_of ENTRY -- the per-host remote command override, or empty if
+# ENTRY carries none (the caller then falls back to $REMOTE_CMD_DEFAULT).
+remote_cmd_of() {
+  [[ $1 == *=* ]] && printf '%s' "${1#*=}"
 }
 
 # read_hosts_file -- one entry per line from $HOSTS_FILE, "#" comments
@@ -43,11 +70,13 @@ read_hosts_file() {
   done <"$HOSTS_FILE"
 }
 
-# classify_error RC STDERR -- a short label distinguishing what ssh's exit
-# code and stderr reasonably let us tell apart: unreachable, auth failure,
-# timeout, or a remote command that is not installed.
+# classify_error RC STDERR REMOTE_CMD -- a short label distinguishing what
+# ssh's exit code and stderr reasonably let us tell apart: unreachable, auth
+# failure, timeout, or a remote command that is not installed -- named
+# specifically (REMOTE_CMD's basename) since a missing command is the single
+# most likely first-run problem.
 classify_error() {
-  local rc=$1 stderr=$2 first
+  local rc=$1 stderr=$2 remote_cmd=$3 first
   if ((rc == 124 || rc == 137)); then
     printf 'timeout'
   elif ((rc == 255)); then
@@ -64,7 +93,7 @@ classify_error() {
       printf 'ssh error: %s' "${first:-exit $rc}"
     fi
   elif ((rc == 127)); then
-    printf 'remote command missing'
+    printf 'remote %s not found' "${remote_cmd##*/}"
   else
     first=$(head -n1 <<<"$stderr")
     if [[ -n $first ]]; then
@@ -81,8 +110,11 @@ classify_error() {
 # whichever loses the race for a host simply skips it, leaving the winner's
 # write in place.
 fetch_one() {
-  local entry=$1 host lockfile outfile tmpfile stderr_file raw rc
+  local entry=$1 host target remote_cmd lockfile outfile tmpfile stderr_file raw rc
   host=$(host_of "$entry")
+  target=$(target_of "$entry")
+  remote_cmd=$(remote_cmd_of "$entry")
+  [[ -n $remote_cmd ]] || remote_cmd=$REMOTE_CMD_DEFAULT
   lockfile="$CACHE_DIR/.$host.lock"
   outfile="$CACHE_DIR/$host.json"
 
@@ -97,7 +129,7 @@ fetch_one() {
   if raw=$(timeout "$OVERALL_TIMEOUT" "$SSH_BIN" \
         -o BatchMode=yes -o ConnectTimeout="$CONNECT_TIMEOUT" \
         -o StrictHostKeyChecking=accept-new \
-        "$entry" claude-sessions 2>"$stderr_file"); then
+        "$target" "$remote_cmd" 2>"$stderr_file"); then
     if [[ -n $raw ]] && jq -e . >/dev/null 2>&1 <<<"$raw"; then
       payload=$raw
       ok=true
@@ -106,7 +138,7 @@ fetch_one() {
     fi
   else
     rc=$?
-    error_msg=$(classify_error "$rc" "$(<"$stderr_file")")
+    error_msg=$(classify_error "$rc" "$(<"$stderr_file")" "$remote_cmd")
   fi
   rm -f "$stderr_file"
 
