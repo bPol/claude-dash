@@ -25,13 +25,17 @@ if [[ -z $local_out ]] || ! jq -e . >/dev/null 2>&1 <<<"$local_out"; then
     '{host:$host, generated_at:$now, degraded:true, unreadable:0, sessions:[]}')
 fi
 
-# One field per line, not @tsv -- @tsv joins with a literal tab, and `read`'s
-# default IFS treats tab as IFS whitespace: a leading empty field (a null
-# .host) collapses away instead of staying an empty first field, shifting
-# every field after it left by one. `.host // ""` also turns a null host into
-# an actual empty line rather than the literal string "null", so the fallback
-# below still triggers correctly.
-mapfile -t local_fields < <(jq -r '.host // "", .generated_at, .degraded, .unreadable' <<<"$local_out")
+# NUL-delimited, not newline-delimited: a newline-per-field (even one value
+# per line via plain `.host // "", .generated_at, ...`) still breaks the
+# moment .host ITSELF contains an embedded newline -- jq prints that value
+# across two lines, and mapfile has no way to tell "this newline is INSIDE
+# the host value" from "this newline SEPARATES two fields", shifting every
+# field after it left by one, same failure class as @tsv's IFS-collapse did
+# for a null host before. NUL cannot appear in a JSON string at all, so it is
+# the one byte immune to this regardless of what the host value contains.
+# `.host // ""` also turns a null host into an actual empty field rather than
+# the literal string "null", so the fallback below still triggers correctly.
+mapfile -d '' -t local_fields < <(jq -j '(.host // ""), "\u0000", .generated_at, "\u0000", .degraded, "\u0000", .unreadable, "\u0000"' <<<"$local_out")
 local_host=${local_fields[0]:-}
 local_generated_at=${local_fields[1]:-}
 local_degraded=${local_fields[2]:-}

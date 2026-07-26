@@ -1336,6 +1336,41 @@ check "a local payload past the historical argv breaking point: no 'Argument lis
   "$(grep -c 'Argument list too long' "$root/stderr" || true)" "0"
 rm -rf "$d" "$root"
 
+# --- finding 4 (MINOR): the local host field can still shift columns -------
+# mapfile splits on NEWLINES just as `read` split on IFS: a local .host
+# containing an embedded newline still shifts every field after it, since
+# jq -r prints it across two lines and mapfile has no way to tell "this
+# newline is INSIDE the host value" from "this newline SEPARATES two fields".
+root=$(new_root)
+cache=$root/cache
+hosts=$root/no-such-hosts-file
+d=$(mktemp -d "${TMPDIR:-/tmp}/claude-dash-newlinehost.XXXXXX")
+jq -n -c '{host:"abc\ndef",generated_at:222333,degraded:true,unreadable:7,sessions:[]}' \
+  >"$d/payload.json"
+printf '#!/usr/bin/env bash\ncat "%s/payload.json"\n' "$d" >"$d/producer"
+chmod +x "$d/producer"
+out=$(CLAUDE_DASH_LOCAL_PRODUCER="$d/producer" CLAUDE_DASH_CACHE=$cache \
+      CLAUDE_DASH_HOSTS=$hosts "$BIN/claude-sessions-all")
+check "newline-embedded local host: degraded keeps its real value, not shifted" \
+  "$(jq -r '.degraded' <<<"$out")" "true"
+check "newline-embedded local host: unreadable keeps its real value, not shifted" \
+  "$(jq -r '.unreadable' <<<"$out")" "7"
+check "newline-embedded local host: the hosts entry's fetched_at is the real generated_at" \
+  "$(jq -r '.hosts[0].fetched_at' <<<"$out")" "222333"
+rm -rf "$d" "$root"
+
+# The other half of finding 4: `claude-sessions` itself must not hand out a
+# $CLAUDE_DASH_HOST containing control characters (a newline in particular)
+# in the first place -- defense in depth for the real producer, independent
+# of whatever a stub/override producer does.
+root=$(new_root)
+out=$(CLAUDE_DASH_ROOT=$root CLAUDE_DASH_HOST="$(printf 'evil\nhost')" "$BIN/claude-sessions")
+check "claude-sessions strips control characters from CLAUDE_DASH_HOST at capture" \
+  "$(jq -r '.host | test("[[:cntrl:]]")' <<<"$out")" "false"
+check "claude-sessions' sanitised host still carries the non-control text" \
+  "$(jq -r '.host' <<<"$out")" "evilhost"
+rm -rf "$root"
+
 printf '\nclaude-sessions-all: two consumers polling concurrently\n'
 
 # In real use, the badge and the board are two SEPARATE processes, each on
