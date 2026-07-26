@@ -3,7 +3,7 @@
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-PRODUCER=${CLAUDE_DASH_PRODUCER:-$HERE/claude-sessions}
+PRODUCER=${CLAUDE_DASH_PRODUCER:-$HERE/claude-sessions-all}
 LIVE_INTERVAL=${CLAUDE_DASH_INTERVAL:-2}
 IDLE_INTERVAL=${CLAUDE_DASH_IDLE_INTERVAL:-60}
 INTERVAL=$LIVE_INTERVAL
@@ -23,12 +23,17 @@ frame() {
     return
   fi
   jq -r --argjson w "$width" '
+    # A backwards clock step (NTP correction, suspend/resume drift) can make a
+    # fetched_at/updatedAt look like it is in the future, yielding a negative
+    # duration -- clamp at 0 rather than render a nonsensical "-3600s ago".
     def age:
       if . == null then "—"
-      elif . < 60000 then "\((. / 1000 | floor))s"
-      elif . < 3600000 then "\((. / 60000 | floor))m"
-      elif . < 86400000 then "\((. / 3600000 | floor))h"
-      else "\((. / 86400000 | floor))d" end;
+      else ([., 0] | max) as $ms
+      | if $ms < 60000 then "\(($ms / 1000 | floor))s"
+        elif $ms < 3600000 then "\(($ms / 60000 | floor))m"
+        elif $ms < 86400000 then "\(($ms / 3600000 | floor))h"
+        else "\(($ms / 86400000 | floor))d" end
+      end;
     # pad($n) fits a field to exactly $n columns: padded with spaces when it
     # fits, or cut with a trailing "…" when it does not, so a truncated name
     # or needs-text reads as cut off rather than merely coincidentally short.
@@ -53,26 +58,54 @@ frame() {
       "\(((.needs // .cwd) | pad($midw))) \(.idle_ms | age)";
 
     ($w - 46) as $midw
-    | (.sessions | map(select(.finished | not))) as $live
-    | (.sessions | map(select(.finished)))       as $done
+    # `.hosts` only exists on claude-sessions-all output; a plain
+    # claude-sessions producer (no remotes configured) has neither `.hosts`
+    # nor a `.host` field per session, so both default to a single local
+    # group keyed off the top-level `.host` -- this is what keeps a
+    # single-machine board identical to before.
+    | (.host) as $top_host
+    | (.hosts // [{host:$top_host, kind:"local", fetched_at:.generated_at, age_ms:0, status:"fresh", error:null}]) as $hostlist
+    | (.sessions | map(. + {host: (.host // $top_host)})) as $sess
+    | ($sess | map(select(.finished | not))) as $live
     | ($live | map(select(.state == "blocked")) | length) as $nblocked
     | ($live | map(select(.working and .state != "blocked")) | length) as $nbusy
     | ($live | map(select((.working | not) and .state != "blocked")) | length) as $nidle
-    | ($live | map(select(.kind == "interactive"))) as $inter
-    | ($live | map(select(.kind == "bg")))          as $bg
-    | [ " claude sessions · \(.host)" +
+    # One block per host: local first (no heading of its own -- the top
+    # title already names it), then one block per remote host with its
+    # status in the header. Each block keeps the INTERACTIVE/BACKGROUND
+    # split and the collapsed "N finished" line, exactly like the
+    # single-host board did.
+    | ($hostlist | map(
+        . as $hd
+        | ($sess | map(select(.host == $hd.host))) as $rows
+        | ($rows | map(select(.finished | not))) as $hlive
+        | ($rows | map(select(.finished)))       as $hdone
+        | ($hlive | map(select(.kind == "interactive"))) as $inter
+        | ($hlive | map(select(.kind == "bg")))          as $bg
+        | ( (if $hd.kind == "local" then [] else
+               [ " " + $hd.host
+                 + (if $hd.status == "unreachable" then
+                      "  unreachable" + (if $hd.error then ": \($hd.error)" else "" end)
+                    elif $hd.status == "stale" then
+                      "  (\($hd.age_ms | age) ago)"
+                    else "" end) ]
+             end)
+          + (if ($inter | length) > 0
+             then [" INTERACTIVE"] + ($inter | map(row($midw))) + [""] else [] end)
+          + (if ($bg | length) > 0
+             then [" BACKGROUND"]  + ($bg    | map(row($midw))) + [""] else [] end)
+          + (if ($hdone | length) > 0
+             then ["   … \($hdone | length) finished (\($hdone | map(.name) | join(", ")))"]
+             else [] end)
+        )
+      )) as $blocks
+    | [ " claude sessions · \($top_host)" +
         (if .degraded then "   ⚠ degraded (CLI fallback)" else "" end) +
         (if .unreadable > 0 then "   ⚠ \(.unreadable) unreadable" else "" end),
         "   \($nbusy) busy · \($nblocked) blocked · \($nidle) idle",
         "" ]
-      + (if ($inter | length) > 0
-         then [" INTERACTIVE"] + ($inter | map(row($midw))) + [""] else [] end)
-      + (if ($bg | length) > 0
-         then [" BACKGROUND"]  + ($bg    | map(row($midw))) + [""] else [] end)
+      + ($blocks | flatten)
       + (if ($live | length) == 0 then ["   no sessions running", ""] else [] end)
-      + (if ($done | length) > 0
-         then ["   … \($done | length) finished (\($done | map(.name) | join(", ")))"]
-         else [] end)
       + ["", "   q close"]
       | .[]
       | .[0:$w]' <<<"$data" 2>/dev/null \

@@ -1,0 +1,251 @@
+#!/usr/bin/env bash
+# The merged producer: local sessions (from claude-sessions) plus every
+# remote host's last-fetched cache (from claude-dash-fetch), with a `host`
+# field on every row. Never touches the network itself -- it only reads
+# whatever claude-dash-fetch already wrote, and kicks off a fully detached
+# refresh when that looks stale. This is what the badge and board read by
+# default.
+set -uo pipefail
+
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+LOCAL_PRODUCER=${CLAUDE_DASH_LOCAL_PRODUCER:-$HERE/claude-sessions}
+CACHE_DIR=${CLAUDE_DASH_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/claude-dash}
+HOSTS_FILE=${CLAUDE_DASH_HOSTS:-$HOME/.config/claude-dash/hosts}
+STALE_AFTER=${CLAUDE_DASH_STALE_AFTER:-45}
+FETCH_EVERY=${CLAUDE_DASH_FETCH_EVERY:-20}
+FETCH_BIN=${CLAUDE_DASH_FETCH:-$HERE/claude-dash-fetch}
+FETCH_STAMP=${CLAUDE_DASH_FETCH_STAMP:-$CACHE_DIR/.fetch-trigger-stamp}
+NOW_MS=$(date +%s%3N)
+
+# --- local rows -------------------------------------------------------
+local_out=$("$LOCAL_PRODUCER" 2>/dev/null) || local_out=''
+if [[ -z $local_out ]] || ! jq -e . >/dev/null 2>&1 <<<"$local_out"; then
+  fallback_host=${CLAUDE_DASH_HOST:-$(uname -n)}
+  local_out=$(jq -n --arg host "$fallback_host" --argjson now "$NOW_MS" \
+    '{host:$host, generated_at:$now, degraded:true, unreadable:0, sessions:[]}')
+fi
+
+# NUL-delimited, not newline-delimited: a newline-per-field (even one value
+# per line via plain `.host // "", .generated_at, ...`) still breaks the
+# moment .host ITSELF contains an embedded newline -- jq prints that value
+# across two lines, and mapfile has no way to tell "this newline is INSIDE
+# the host value" from "this newline SEPARATES two fields", shifting every
+# field after it left by one, same failure class as @tsv's IFS-collapse did
+# for a null host before. NUL cannot appear in a JSON string at all, so it is
+# the one byte immune to this regardless of what the host value contains.
+# `.host // ""` also turns a null host into an actual empty field rather than
+# the literal string "null", so the fallback below still triggers correctly.
+mapfile -d '' -t local_fields < <(jq -j '(.host // ""), "\u0000", .generated_at, "\u0000", .degraded, "\u0000", .unreadable, "\u0000"' <<<"$local_out")
+local_host=${local_fields[0]:-}
+local_generated_at=${local_fields[1]:-}
+local_degraded=${local_fields[2]:-}
+local_unreadable=${local_fields[3]:-}
+[[ -n $local_host ]] || local_host=${CLAUDE_DASH_HOST:-$(uname -n)}
+local_sessions=$(jq -c --arg h "$local_host" \
+  '[ (.sessions // [])[] | . + {host:$h} ]' <<<"$local_out")
+
+# Carried through a FILE, never a bash variable fed to --argjson, for the
+# exact same reason the remote cache content is (see below): a local
+# producer can legitimately have hundreds of sessions, and --argjson's value
+# goes through argv, which is bounded by ARG_MAX/MAX_ARG_STRLEN (~128KB per
+# single argument) well before that many sessions' worth of JSON gets large.
+# Only the remote path had this fix before; the local path hit the identical
+# "Argument list too long" failure, just needing more sessions to trigger it.
+local_sessions_file=$(mktemp "${TMPDIR:-/tmp}/claude-dash-localsessions.XXXXXX")
+printf '%s' "$local_sessions" >"$local_sessions_file"
+
+# --- remote rows: every cache file, whatever the current hosts list says --
+shopt -s nullglob
+cache_files=("$CACHE_DIR"/*.json)
+shopt -u nullglob
+
+# Cache content is carried through files, never a bash variable fed to
+# --argjson: a remote's cached payload can be arbitrarily large (the size
+# cap in claude-dash-fetch bounds a FRESH fetch, not an older cache file
+# already sitting on disk), and --argjson's value goes through argv, which
+# is bounded by ARG_MAX.
+caches_file=$(mktemp "${TMPDIR:-/tmp}/claude-dash-caches.XXXXXX")
+invalid_hosts_file=$(mktemp "${TMPDIR:-/tmp}/claude-dash-invalidhosts.XXXXXX")
+: >"$invalid_hosts_file"
+printf '[]' >"$caches_file"
+
+if ((${#cache_files[@]})); then
+  if ! jq -c -s '.' "${cache_files[@]}" >"$caches_file" 2>/dev/null; then
+    # One cache file was unreadable/corrupt JSON, and jq has no partial-batch
+    # mode -- a single bad file fails the whole slurp. Re-check per file
+    # instead, exactly like claude-sessions does for the local registry: one
+    # corrupt remote must cost only that remote, never the whole merge.
+    ndjson_file=$(mktemp "${TMPDIR:-/tmp}/claude-dash-cachesnd.XXXXXX")
+    : >"$ndjson_file"
+    for f in "${cache_files[@]}"; do
+      if ! jq -c '.' "$f" >>"$ndjson_file" 2>/dev/null; then
+        basename "$f" .json >>"$invalid_hosts_file"
+      fi
+    done
+    jq -c -s '.' "$ndjson_file" >"$caches_file" 2>/dev/null || printf '[]' >"$caches_file"
+    rm -f "$ndjson_file"
+  fi
+fi
+
+merged=$(jq -n \
+  --arg local_host "$local_host" --argjson now "$NOW_MS" \
+  --argjson local_generated_at "${local_generated_at:-$NOW_MS}" \
+  --argjson degraded "${local_degraded:-false}" \
+  --argjson unreadable "${local_unreadable:-0}" \
+  --argjson stale_ms "$((STALE_AFTER * 1000))" \
+  --rawfile local_sessions_raw "$local_sessions_file" \
+  --rawfile caches_raw "$caches_file" --rawfile invalid_hosts_raw "$invalid_hosts_file" '
+  ($local_sessions_raw | fromjson) as $local_sessions
+  | def status_of($ok; $fetched_at):
+    if ($ok != true) then "unreachable"
+    elif ($fetched_at == null) then "stale"
+    elif ($now - $fetched_at) < $stale_ms then "fresh"
+    else "stale" end;
+
+  # A remote JSON payload is a trust boundary in TYPE as well as in VALUE:
+  # shape validation (payload_valid/entry_valid below) only ever proved a
+  # field exists in roughly the right container, never that e.g. `.name` is
+  # actually a string. `clean` gsubs several fields unconditionally, and
+  # gsub raises a hard type error on anything but a string -- so a bad type
+  # reaching it (a number, an array, an object) must never be possible: this
+  # is the ONE place every remote-sourced field passes through before that
+  # happens, coercing anything else into a safe string first. Numbers/
+  # booleans render as their ordinary string form; an array/object (never
+  # legitimately expected here) becomes a harmless fixed placeholder instead
+  # of throwing. null stays null -- every field this feeds is nullable in the
+  # output schema.
+  def stringify:
+    if . == null then null
+    elif type == "string" then .
+    elif type == "number" or type == "boolean" then tostring
+    else "[invalid value]"
+    end;
+
+  # Sanitiser for every remote-sourced string, applied HERE because the
+  # remote producer is exactly the thing we cannot trust to have done it
+  # itself. Idempotent WITHOUT a lossy unescape/re-escape round trip: a
+  # legitimate value that happens to contain the literal text "&amp;lt;"
+  # (never itself run through this escaping) must survive unchanged, which
+  # unescaping-then-re-escaping cannot guarantee -- it would decode that
+  # literal text into "&lt;", rendering as "<". Instead, only escape an "&"
+  # that does NOT already begin one of the three entities this function
+  # itself produces (a negative lookahead) -- an "&" already part of "&amp;",
+  # "&lt;" or "&gt;" is left alone, so re-running this on already-clean text
+  # (already the output of this same function, or the identical `clean` in
+  # claude-sessions on a remote row cleaned once by its own machine) is a
+  # true no-op, and raw "<"/">" are always escaped unconditionally (a value
+  # already escaped never contains a raw angle bracket to double-encode).
+  # Stripping control characters (\n \r \t and NEL U+0085, via [[:cntrl:]])
+  # plus the two Unicode line-breaking characters outside that class -- U+2028
+  # LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR, both of which Pango treats
+  # as a mandatory line break -- is what stops a remote value from forging a
+  # fake row or host heading in the line-oriented board/tooltip.
+  def clean:
+    stringify
+    | if . == null then null
+      else
+        gsub("[[:cntrl:]  ]"; "")
+        | gsub("&(?!(amp|lt|gt);)"; "&amp;")
+        | gsub("<"; "&lt;") | gsub(">"; "&gt;")
+      end;
+  def clean_row:
+    . + { name: (.name | clean), cwd: (.cwd | clean), needs: (.needs | clean),
+          status: (.status | clean), state: (.state | clean), host: (.host | clean) };
+  def clean_entry:
+    . + { host: (.host | clean), error: (.error | clean) };
+
+  # A remote is a trust boundary: its cached response can be malformed --
+  # not an object at all, or a `.sessions` that is not an array of objects.
+  # Order matters below: each `and`/`or` only reaches its right side once
+  # the left has already narrowed the type (jq boolean operators
+  # short-circuit), so this never raises a jq type error on the wrong shape
+  # -- a bad shape is simply treated as invalid, exactly like a cache file
+  # that failed to parse as JSON at all.
+  def payload_valid:
+    (type == "object")
+    and ((.sessions // []) | type == "array")
+    and ((.sessions // []) | all(type == "object"));
+  def entry_valid:
+    (type == "object")
+    and (.fetched_at == null or (.fetched_at | type) == "number")
+    and (.payload == null or (.payload | payload_valid));
+  def safe_host:
+    if (type == "object") then (.host // "unknown") else "unknown" end;
+
+  ($caches_raw | fromjson) as $caches
+  | ($invalid_hosts_raw | rtrimstr("\n")
+     | (if length == 0 then [] else split("\n") end)) as $corrupt_hosts
+
+  | ($caches | map(
+       if entry_valid then
+         (.host // "unknown") as $h
+         | { entry: { host: $h, kind: "remote",
+                      fetched_at: (.fetched_at // null),
+                      age_ms: (if .fetched_at then ($now - .fetched_at) else null end),
+                      status: status_of(.ok; .fetched_at),
+                      error: (.error // null) },
+             rows: ((.payload.sessions // []) | map(. + {host: $h})) }
+       else
+         { entry: { host: safe_host, kind: "remote", fetched_at: null, age_ms: null,
+                     status: "unreachable", error: "invalid payload shape" },
+           rows: [] }
+       end
+     )) as $remote
+  | ($corrupt_hosts | map({
+       entry: { host: ., kind: "remote", fetched_at: null, age_ms: null,
+                status: "unreachable", error: "corrupt cache" },
+       rows: [] })) as $corrupt
+  | ($remote + $corrupt) as $all
+  | { host: $local_host, generated_at: $now, degraded: $degraded, unreadable: $unreadable,
+      hosts: ([{ host: $local_host, kind: "local", fetched_at: $local_generated_at,
+                  age_ms: 0, status: "fresh", error: null }]
+              + ($all | map(.entry | clean_entry))),
+      sessions: ($local_sessions + ($all | map(.rows) | add // [] | map(clean_row))) }')
+rm -f "$local_sessions_file" "$caches_file" "$invalid_hosts_file"
+
+# --- trigger a refresh, never blocking on it --------------------------
+# Only when there is somewhere to fetch from: a fresh install or a plain
+# single-machine setup must cost nothing extra here. install.sh always
+# scaffolds a hosts file (comments and blank lines only), so gating on the
+# file merely EXISTING would spawn claude-dash-fetch every poll forever on a
+# single-machine install -- gate on there being at least one parsed entry
+# instead. Mirrors claude-dash-fetch's own read_hosts_file: strip a trailing
+# "#" comment, trim surrounding whitespace, count what is left.
+host_count=0
+if [[ -f $HOSTS_FILE ]]; then
+  while IFS= read -r hline || [[ -n $hline ]]; do
+    hline=${hline%%#*}
+    hline="${hline#"${hline%%[![:space:]]*}"}"
+    hline="${hline%"${hline##*[![:space:]]}"}"
+    [[ -n $hline ]] && host_count=$((host_count + 1))
+  done <"$HOSTS_FILE"
+fi
+if ((host_count > 0)); then
+  newest=0
+  for f in "${cache_files[@]}"; do
+    mt=$(stat -c %Y "$f" 2>/dev/null || printf '0')
+    ((mt > newest)) && newest=$mt
+  done
+  now_s=$(date +%s)
+  cache_age=$((now_s - newest))
+  fetch_due=false
+  if ((${#cache_files[@]} == 0)) || ((cache_age > FETCH_EVERY)); then
+    stamp_age=$((FETCH_EVERY + 1))
+    if [[ -f $FETCH_STAMP ]]; then
+      stamp_age=$((now_s - $(stat -c %Y "$FETCH_STAMP" 2>/dev/null || printf '0')))
+    fi
+    ((stamp_age >= FETCH_EVERY)) && fetch_due=true
+  fi
+  if [[ $fetch_due == true ]]; then
+    mkdir -p "$(dirname "$FETCH_STAMP")" 2>/dev/null
+    : >"$FETCH_STAMP" 2>/dev/null
+    if command -v setsid >/dev/null 2>&1; then
+      setsid "$FETCH_BIN" </dev/null >/dev/null 2>&1 &
+    else
+      "$FETCH_BIN" </dev/null >/dev/null 2>&1 &
+    fi
+    disown 2>/dev/null || true
+  fi
+fi
+
+printf '%s\n' "$merged"

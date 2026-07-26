@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+# Refresh the remote session cache: one `ssh ... claude-sessions` per
+# configured host, run in parallel, written atomically so a reader never sees
+# a half-written file. Never on the fast 2s poll path -- claude-sessions-all
+# spawns this fully detached when the cache goes stale and reads whatever is
+# already on disk in the meantime.
+set -uo pipefail
+
+HOSTS_FILE=${CLAUDE_DASH_HOSTS:-$HOME/.config/claude-dash/hosts}
+CACHE_DIR=${CLAUDE_DASH_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/claude-dash}
+CONNECT_TIMEOUT=${CLAUDE_DASH_FETCH_CONNECT_TIMEOUT:-5}
+OVERALL_TIMEOUT=${CLAUDE_DASH_FETCH_TIMEOUT:-10}
+SSH_BIN=${CLAUDE_DASH_SSH:-ssh}
+# A remote is a trust boundary: its response is data, not truth. Cap what it
+# may contribute (default 1MiB) so one oversized reply cannot blow past
+# ARG_MAX downstream or bloat the cache file without limit; a response over
+# the cap is treated as a failure with an explicit error, same as any other
+# unreachable/invalid response.
+MAX_PAYLOAD_BYTES=${CLAUDE_DASH_MAX_PAYLOAD_BYTES:-1048576}
+# Shape AND type check for a remote response, run before it is ever trusted
+# enough to cache as ok:true: must be a JSON object, and if `.sessions` is
+# present it must be an array of objects -- not an array of scalars, not a
+# string, not an object. A shape-only check is not enough, though: a session
+# object can have the right SHAPE while a field the merge later gsubs on
+# (name/cwd/needs/status/state) carries the wrong TYPE -- a number, an array,
+# an object -- so those are checked too, each required to be a string or
+# (where the field is nullable) null. This is a best-effort, "obviously
+# wrong" gate, not exhaustive: claude-sessions-all own merge still coerces
+# any type safely regardless, since a cache file can also be written by an
+# older/buggy fetch that never ran this check at all. Order matters: each
+# `and` only reaches its right side once the left side has already narrowed
+# the type, so this never raises a jq type error on the wrong shape (jq
+# `and`/`or` short-circuit).
+PAYLOAD_SHAPE_OK='
+  (type == "object")
+  and ((.sessions // []) | type == "array")
+  and ((.sessions // []) | all(
+        type == "object"
+        and ((.name  // null) == null or (.name  | type) == "string")
+        and ((.cwd   // null) == null or (.cwd   | type) == "string")
+        and ((.needs // null) == null or (.needs | type) == "string")
+        and ((.status// null) == null or (.status| type) == "string")
+        and ((.state // null) == null or (.state | type) == "string")
+      ))
+'
+# The remote's non-interactive PATH is minimal (no ~/.local/bin), so an
+# explicit command is required -- see README's "Aggregating other machines".
+# The tilde below is deliberately unexpanded HERE: it is passed through to
+# the remote shell, which expands it against the remote user's own home.
+# shellcheck disable=SC2088 # tilde deliberately unexpanded: the REMOTE shell expands it, not this one
+DEFAULT_REMOTE_CMD='~/.local/bin/claude-sessions'
+REMOTE_CMD_DEFAULT=${CLAUDE_DASH_REMOTE_CMD:-$DEFAULT_REMOTE_CMD}
+
+only_host=""
+if [[ ${1:-} == --host ]]; then
+  only_host=${2:-}
+  if [[ -z $only_host ]]; then
+    printf 'claude-dash-fetch: --host requires an argument\n' >&2
+    exit 1
+  fi
+fi
+
+mkdir -p "$CACHE_DIR" 2>/dev/null
+
+# A hosts-file entry is "[user@]host[=remote_cmd]" -- the "=remote_cmd" tail
+# is an optional per-host override of the command run over ssh, for a remote
+# whose claude-sessions lives somewhere other than the default. "=" is safe
+# as the delimiter: it cannot appear in a hostname or username.
+
+# target_of ENTRY -- the "[user@]host" ssh target, with any "=remote_cmd"
+# tail stripped.
+target_of() {
+  printf '%s' "${1%%=*}"
+}
+
+# host_of ENTRY -- "user@host[=cmd]" or "host[=cmd]" -> "host". Used for the
+# cache filename and every label shown to the user; the login user never
+# appears. A hosts-file entry is meant to be a bare hostname, but nothing
+# stops a crafted one from carrying "/" -- strip it so the result can never
+# turn the cache filename into a path that writes outside CACHE_DIR.
+host_of() {
+  local target host
+  target=$(target_of "$1")
+  host=${target##*@}
+  printf '%s' "${host//\//_}"
+}
+
+# remote_cmd_of ENTRY -- the per-host remote command override, or empty if
+# ENTRY carries none (the caller then falls back to $REMOTE_CMD_DEFAULT).
+remote_cmd_of() {
+  [[ $1 == *=* ]] && printf '%s' "${1#*=}"
+}
+
+# read_hosts_file -- one entry per line from $HOSTS_FILE, "#" comments
+# (including trailing) and blank lines ignored, surrounding whitespace
+# trimmed. Prints nothing, successfully, when the file does not exist.
+read_hosts_file() {
+  [[ -f $HOSTS_FILE ]] || return 0
+  local line
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%%#*}
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -n $line ]] && printf '%s\n' "$line"
+  done <"$HOSTS_FILE"
+}
+
+# classify_error RC STDERR REMOTE_CMD -- a short label distinguishing what
+# ssh's exit code and stderr reasonably let us tell apart: unreachable, auth
+# failure, timeout, or a remote command that is not installed -- named
+# specifically (REMOTE_CMD's basename) since a missing command is the single
+# most likely first-run problem.
+classify_error() {
+  local rc=$1 stderr=$2 remote_cmd=$3 first
+  if ((rc == 124 || rc == 137)); then
+    printf 'timeout'
+  elif ((rc == 255)); then
+    if [[ $stderr == *"Permission denied"* ]]; then
+      printf 'auth failed'
+    elif [[ $stderr == *"Could not resolve hostname"* || $stderr == *"Name or service not known"* ]]; then
+      printf 'unreachable (dns)'
+    elif [[ $stderr == *"Connection refused"* ]]; then
+      printf 'unreachable (connection refused)'
+    elif [[ $stderr == *"No route to host"* || $stderr == *"Connection timed out"* ]]; then
+      printf 'unreachable'
+    else
+      first=$(head -n1 <<<"$stderr")
+      printf 'ssh error: %s' "${first:-exit $rc}"
+    fi
+  elif ((rc == 127)); then
+    printf 'remote %s not found' "${remote_cmd##*/}"
+  else
+    first=$(head -n1 <<<"$stderr")
+    if [[ -n $first ]]; then
+      printf 'remote error: %s' "$first"
+    else
+      printf 'remote error (exit %d)' "$rc"
+    fi
+  fi
+}
+
+# fetch_one ENTRY -- refresh exactly one host's cache file. Locked per host
+# (fd 9, in this call's own subshell -- fetch_one always runs backgrounded)
+# so two concurrent claude-dash-fetch runs cannot stampede the same target;
+# whichever loses the race for a host simply skips it, leaving the winner's
+# write in place.
+fetch_one() {
+  local entry=$1 host target remote_cmd lockfile outfile tmpfile stderr_file raw rc
+  host=$(host_of "$entry")
+  target=$(target_of "$entry")
+  remote_cmd=$(remote_cmd_of "$entry")
+  [[ -n $remote_cmd ]] || remote_cmd=$REMOTE_CMD_DEFAULT
+  lockfile="$CACHE_DIR/.$host.lock"
+  outfile="$CACHE_DIR/$host.json"
+
+  exec 9>"$lockfile" 2>/dev/null || return 0
+  if ! flock -n 9; then
+    exec 9>&-
+    return 0
+  fi
+
+  stderr_file=$(mktemp "${TMPDIR:-/tmp}/claude-dash-fetch-err.XXXXXX")
+  # The payload is carried through a FILE, never a bash variable fed to
+  # --argjson: a remote response (or a preserved last-known-good payload) can
+  # be arbitrarily large, and --argjson passes its value through argv, which
+  # is bounded by ARG_MAX. A file has no such limit.
+  local payload_file
+  payload_file=$(mktemp "${TMPDIR:-/tmp}/claude-dash-fetch-payload.XXXXXX")
+  printf 'null' >"$payload_file"
+  local ok=false error_msg='' now raw_bytes
+  if raw=$(timeout "$OVERALL_TIMEOUT" "$SSH_BIN" \
+        -o BatchMode=yes -o ConnectTimeout="$CONNECT_TIMEOUT" \
+        -o StrictHostKeyChecking=accept-new \
+        "$target" "$remote_cmd" 2>"$stderr_file"); then
+    raw_bytes=$(printf '%s' "$raw" | wc -c)
+    if ((raw_bytes > MAX_PAYLOAD_BYTES)); then
+      error_msg="response too large (${raw_bytes} bytes, max ${MAX_PAYLOAD_BYTES})"
+    elif [[ -n $raw ]] && jq -e . >/dev/null 2>&1 <<<"$raw" \
+        && jq -e "$PAYLOAD_SHAPE_OK" >/dev/null 2>&1 <<<"$raw"; then
+      printf '%s' "$raw" >"$payload_file"
+      ok=true
+    else
+      error_msg='invalid response'
+    fi
+  else
+    rc=$?
+    error_msg=$(classify_error "$rc" "$(<"$stderr_file")" "$remote_cmd")
+  fi
+  rm -f "$stderr_file"
+
+  if [[ $ok == false && -f $outfile ]]; then
+    # Preserve the previous payload on failure so the board still shows
+    # last-known rows -- marked stale/unreachable by the reader -- rather
+    # than losing them the moment a single poll fails. Extracted straight
+    # into a file, never a bash variable, for the same ARG_MAX reason above.
+    if jq -c '.payload' "$outfile" >"$payload_file.prev" 2>/dev/null \
+        && jq -e '. != null' "$payload_file.prev" >/dev/null 2>&1; then
+      mv -f "$payload_file.prev" "$payload_file"
+    else
+      rm -f "$payload_file.prev"
+    fi
+  fi
+
+  now=$(date +%s%3N)
+  tmpfile=$(mktemp "$CACHE_DIR/.$host.XXXXXX")
+  if jq -n --arg host "$host" --argjson fetched_at "$now" --argjson ok "$ok" \
+        --arg error "$error_msg" --rawfile payload_raw "$payload_file" \
+      '{host:$host, fetched_at:$fetched_at, ok:$ok,
+        error:(if $error == "" then null else $error end), payload:($payload_raw | fromjson)}' \
+      >"$tmpfile" 2>/dev/null; then
+    mv -f "$tmpfile" "$outfile"
+  else
+    rm -f "$tmpfile"
+  fi
+  rm -f "$payload_file"
+
+  flock -u 9
+  exec 9>&-
+}
+
+hosts=()
+if [[ -n $only_host ]]; then
+  hosts=("$only_host")
+else
+  while IFS= read -r h; do hosts+=("$h"); done < <(read_hosts_file)
+fi
+
+((${#hosts[@]})) || exit 0
+
+pids=()
+for entry in "${hosts[@]}"; do
+  fetch_one "$entry" &
+  pids+=($!)
+done
+for pid in "${pids[@]}"; do
+  wait "$pid" 2>/dev/null || true
+done

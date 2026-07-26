@@ -68,6 +68,39 @@ mk_orphan_job() {
     >"$root/jobs/$id/state.json"
 }
 
+# mk_hosts_file PATH LINE... -- write a claude-dash-fetch hosts file, one
+# LINE per argument (comments/blanks included verbatim, so a test can exercise
+# the parser's own comment/blank handling).
+mk_hosts_file() {
+  local path=$1; shift
+  mkdir -p "$(dirname "$path")"
+  printf '%s\n' "$@" >"$path"
+}
+
+# mk_cache_file DIR HOST OK ERROR AGE_S [SESSIONS_JSON]
+# A claude-dash-fetch cache fixture. SESSIONS_JSON defaults to "null"
+# (no payload ever recorded); pass an array to give the host a payload even
+# when OK is false, modelling a preserved last-known-good result.
+mk_cache_file() {
+  local dir=$1 host=$2 ok=$3 error=$4 age_s=$5 sessions_json=${6:-null}
+  mkdir -p "$dir"
+  local now fetched_at payload error_json
+  now=$(date +%s%3N)
+  fetched_at=$((now - age_s * 1000))
+  if [[ $sessions_json == null ]]; then
+    payload=null
+  else
+    payload=$(jq -n --arg h "$host" --argjson now "$fetched_at" --argjson s "$sessions_json" \
+      '{host:$h, generated_at:$now, degraded:false, unreadable:0, sessions:$s}')
+  fi
+  error_json=null
+  [[ -n $error ]] && error_json=$(printf '%s' "$error" | jq -Rs .)
+  jq -n --arg host "$host" --argjson fetched_at "$fetched_at" --argjson ok "$ok" \
+        --argjson error "$error_json" --argjson payload "$payload" \
+    '{host:$host, fetched_at:$fetched_at, ok:$ok, error:$error, payload:$payload}' \
+    >"$dir/$host.json"
+}
+
 # check DESCRIPTION ACTUAL EXPECTED
 check() {
   TESTS_RUN=$((TESTS_RUN + 1))

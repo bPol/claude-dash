@@ -7,6 +7,13 @@ ROOT=${CLAUDE_DASH_ROOT:-$HOME/.claude}
 SESSIONS_DIR=$ROOT/sessions
 JOBS_DIR=$ROOT/jobs
 HOST=${CLAUDE_DASH_HOST:-$(uname -n)}
+# Defense in depth for claude-sessions-all's merge (a local .host containing
+# a control character, a newline in particular, can otherwise still shift
+# every field after it when read back -- see claude-sessions-all's own
+# NUL-delimited fix for the other half of this): strip control characters
+# from the host label at the exact point it is captured, before it can reach
+# anything downstream.
+HOST=$(printf '%s' "$HOST" | tr -d '\000-\037\177')
 NOW=$(date +%s%3N)
 
 CLI=${CLAUDE_DASH_CLI:-claude}
@@ -102,7 +109,12 @@ fi
 JQ_CLEAN_DEF='
 def clean:
   if . == null then null
-  else gsub("[[:cntrl:]]"; "")
+  # [[:cntrl:]] strips \n \r \t and NEL (U+0085); U+2028 LINE SEPARATOR and
+  # U+2029 PARAGRAPH SEPARATOR sit outside that POSIX class but Pango still
+  # treats them as a mandatory line break, so they are stripped in the same
+  # pass -- the local registry is trusted for CONTENT, never for whether it
+  # can forge an extra rendered line.
+  else gsub("[[:cntrl:]  ]"; "")
        | gsub("&"; "&amp;") | gsub("<"; "&lt;") | gsub(">"; "&gt;")
   end;
 def rank:
