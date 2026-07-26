@@ -839,6 +839,104 @@ check "corrupt cache file: output is still valid JSON" \
   "$(jq -e . >/dev/null 2>&1 <<<"$out" && echo yes || echo no)" "yes"
 rm -rf "$(dirname "$lp")" "$root"
 
+# A remote is a trust boundary: a cache file that is syntactically valid JSON
+# but structurally the wrong shape (here: .payload.sessions is an array of
+# numbers, not objects) must be treated exactly like an unreachable host --
+# its own block gets an error, nothing else breaks, and LOCAL rows survive.
+# Before the fix this crashed the entire merge (a jq type error trying to
+# add a number and an object), printing nothing at all, exit 0.
+root=$(new_root)
+cache=$root/cache
+mkdir -p "$cache"
+jq -n '{host:"remote6",fetched_at:1,ok:true,error:null,
+        payload:{host:"remote6",generated_at:1,degraded:false,unreadable:0,sessions:[1,2,3]}}' \
+  >"$cache/remote6.json"
+lp=$(producer_stub '[{"kind":"interactive","pid":1,"name":"local survives wrongshape","cwd":"/x","status":"busy","working":true,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
+out=$(CLAUDE_DASH_LOCAL_PRODUCER=$lp CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_HOSTS=$root/no-hosts \
+      "$BIN/claude-sessions-all")
+check "wrong-shape cached payload: exit code is still 0" "$?" "0"
+check "wrong-shape cached payload: output is still valid JSON" \
+  "$(jq -e . >/dev/null 2>&1 <<<"$out" && echo yes || echo no)" "yes"
+check "wrong-shape cached payload: local row survives" \
+  "$(jq -r '[.sessions[] | select(.name == "local survives wrongshape")] | length' <<<"$out")" "1"
+check "wrong-shape cached payload: that host is marked unreachable, not silently dropped" \
+  "$(jq -r '[.hosts[] | select(.host == "remote6")][0].status' <<<"$out")" "unreachable"
+check "wrong-shape cached payload: contributes no rows" \
+  "$(jq -r '[.sessions[] | select(.host == "remote6")] | length' <<<"$out")" "0"
+rm -rf "$(dirname "$lp")" "$root"
+
+# Same wrong-shape principle, at the top level of the cache file this time:
+# a top-level array instead of an object, and a string fetched_at. Neither
+# may crash the merge either.
+root=$(new_root)
+cache=$root/cache
+mkdir -p "$cache"
+printf '[1,2,3]' >"$cache/remote7.json"
+jq -n '{host:"remote8",fetched_at:"not-a-number",ok:true,error:null,
+        payload:{host:"remote8",generated_at:1,degraded:false,unreadable:0,sessions:[]}}' \
+  >"$cache/remote8.json"
+lp=$(producer_stub '[{"kind":"interactive","pid":1,"name":"local survives shape2","cwd":"/x","status":"busy","working":true,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
+out=$(CLAUDE_DASH_LOCAL_PRODUCER=$lp CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_HOSTS=$root/no-hosts \
+      "$BIN/claude-sessions-all")
+check "top-level-array cache file: exit code is still 0" "$?" "0"
+check "top-level-array cache file: local row survives" \
+  "$(jq -r '[.sessions[] | select(.name == "local survives shape2")] | length' <<<"$out")" "1"
+check "string fetched_at cache file: local row survives" \
+  "$(jq -r '[.hosts[] | select(.host == "remote8")][0].status' <<<"$out")" "unreachable"
+rm -rf "$(dirname "$lp")" "$root"
+
+# A payload well past the historical ~260KB argv (ARG_MAX) breaking point,
+# but well under the size cap, must still merge successfully -- proving the
+# payload is carried through the merge without ever going through argv. Built
+# via a file, not mk_cache_file's --argjson: a payload this size hits the
+# very same ARG_MAX limit in the fixture builder as it does in production.
+root=$(new_root)
+cache=$root/cache
+mkdir -p "$cache"
+lp=$(producer_stub '[{"kind":"interactive","pid":1,"name":"local survives big payload","cwd":"/x","status":"busy","working":true,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
+big_sessions_file=$(mktemp "${TMPDIR:-/tmp}/claude-dash-bigsessions.XXXXXX")
+jq -c -n '[range(3000) | {kind:"bg",pid:null,name:("row " + (. | tostring) + (" x" * 100)),cwd:"/y",status:"idle",working:false,state:null,needs:null,idle_ms:1000,job_id:null,finished:false}]' \
+  >"$big_sessions_file"
+jq -n --arg host bigremote --argjson now 1 --rawfile sessions_raw "$big_sessions_file" \
+  '{host:$host, fetched_at:$now, ok:true, error:null,
+    payload:{host:$host, generated_at:$now, degraded:false, unreadable:0,
+             sessions:($sessions_raw | fromjson)}}' \
+  >"$cache/bigremote.json"
+rm -f "$big_sessions_file"
+printf '  .. big-cache fixture size: %s bytes\n' "$(wc -c <"$cache/bigremote.json")"
+out=$(CLAUDE_DASH_LOCAL_PRODUCER=$lp CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_HOSTS=$root/no-hosts \
+      "$BIN/claude-sessions-all")
+check "a payload past the historical argv breaking point: exit code is still 0" "$?" "0"
+check "a payload past the historical argv breaking point: local row survives" \
+  "$(jq -r '[.sessions[] | select(.name == "local survives big payload")] | length' <<<"$out")" "1"
+check "a payload past the historical argv breaking point: all remote rows merged in" \
+  "$(jq -r '[.sessions[] | select(.host == "bigremote")] | length' <<<"$out")" "3000"
+rm -rf "$(dirname "$lp")" "$root"
+
+# End-to-end: a remote response of ~5MB must be rejected by claude-dash-fetch
+# (the size cap) with an explicit error, and claude-sessions-all must then
+# render the local board fine with that host showing the error -- not go
+# blank, not silently drop the host.
+root=$(new_root)
+cache=$root/cache
+hosts=$root/hosts
+mk_hosts_file "$hosts" "huge-host"
+CLAUDE_DASH_HOSTS=$hosts CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_SSH=$SSH_STUB \
+  "$BIN/claude-dash-fetch"
+check "a ~5MB remote response is rejected, not cached as ok" \
+  "$(jq -r '.ok' "$cache/huge-host.json")" "false"
+check "a ~5MB remote response's error names it as too large" \
+  "$(jq -r '.error | contains("too large")' "$cache/huge-host.json")" "true"
+lp=$(producer_stub '[{"kind":"interactive","pid":1,"name":"local survives huge remote","cwd":"/x","status":"busy","working":true,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
+out=$(CLAUDE_DASH_LOCAL_PRODUCER=$lp CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_HOSTS=$root/no-hosts \
+      "$BIN/claude-sessions-all")
+check "after a ~5MB remote response: exit code is still 0" "$?" "0"
+check "after a ~5MB remote response: local row survives, board renders" \
+  "$(jq -r '[.sessions[] | select(.name == "local survives huge remote")] | length' <<<"$out")" "1"
+check "after a ~5MB remote response: that host shows the too-large error" \
+  "$(jq -r '[.hosts[] | select(.host == "huge-host")][0].error | contains("too large")' <<<"$out")" "true"
+rm -rf "$(dirname "$lp")" "$root"
+
 # Ordering: every local row precedes every remote row.
 root=$(new_root)
 cache=$root/cache

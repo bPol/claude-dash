@@ -59,6 +59,14 @@ JSON
     printf '{"host":"wrongshape2-host","generated_at":1000,"degraded":false,"unreadable":0,"sessions":"nope"}\n'
     exit 0
     ;;
+  huge-host)
+    # ~5MB response: well past any sane per-host contribution. Valid JSON,
+    # right shape -- rejected purely on size.
+    printf '{"host":"huge-host","generated_at":1000,"degraded":false,"unreadable":0,"sessions":[{"kind":"bg","pid":null,"name":"'
+    head -c 5000000 </dev/zero | tr '\0' 'x'
+    printf '","cwd":"/y","status":"idle","working":false,"state":null,"needs":null,"idle_ms":1,"job_id":null,"finished":false}]}\n'
+    exit 0
+    ;;
   slow-host)
     sleep "${STUB_SSH_SLEEP:-10}"
     cat <<'JSON'

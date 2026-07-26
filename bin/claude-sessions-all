@@ -45,23 +45,31 @@ shopt -s nullglob
 cache_files=("$CACHE_DIR"/*.json)
 shopt -u nullglob
 
-caches='[]'
-invalid_hosts='[]'
+# Cache content is carried through files, never a bash variable fed to
+# --argjson: a remote's cached payload can be arbitrarily large (the size
+# cap in claude-dash-fetch bounds a FRESH fetch, not an older cache file
+# already sitting on disk), and --argjson's value goes through argv, which
+# is bounded by ARG_MAX.
+caches_file=$(mktemp "${TMPDIR:-/tmp}/claude-dash-caches.XXXXXX")
+invalid_hosts_file=$(mktemp "${TMPDIR:-/tmp}/claude-dash-invalidhosts.XXXXXX")
+: >"$invalid_hosts_file"
+printf '[]' >"$caches_file"
+
 if ((${#cache_files[@]})); then
-  if ! caches=$(jq -c -s '.' "${cache_files[@]}" 2>/dev/null); then
+  if ! jq -c -s '.' "${cache_files[@]}" >"$caches_file" 2>/dev/null; then
     # One cache file was unreadable/corrupt JSON, and jq has no partial-batch
     # mode -- a single bad file fails the whole slurp. Re-check per file
     # instead, exactly like claude-sessions does for the local registry: one
     # corrupt remote must cost only that remote, never the whole merge.
-    caches='[]'
+    ndjson_file=$(mktemp "${TMPDIR:-/tmp}/claude-dash-cachesnd.XXXXXX")
+    : >"$ndjson_file"
     for f in "${cache_files[@]}"; do
-      if item=$(jq -c '.' "$f" 2>/dev/null); then
-        caches=$(jq -n -c --argjson a "$caches" --argjson b "$item" '$a + [$b]')
-      else
-        base=$(basename "$f" .json)
-        invalid_hosts=$(jq -n -c --argjson a "$invalid_hosts" --arg h "$base" '$a + [$h]')
+      if ! jq -c '.' "$f" >>"$ndjson_file" 2>/dev/null; then
+        basename "$f" .json >>"$invalid_hosts_file"
       fi
     done
+    jq -c -s '.' "$ndjson_file" >"$caches_file" 2>/dev/null || printf '[]' >"$caches_file"
+    rm -f "$ndjson_file"
   fi
 fi
 
@@ -72,23 +80,73 @@ merged=$(jq -n \
   --argjson unreadable "${local_unreadable:-0}" \
   --argjson stale_ms "$((STALE_AFTER * 1000))" \
   --argjson local_sessions "$local_sessions" \
-  --argjson caches "$caches" --argjson invalid_hosts "$invalid_hosts" '
+  --rawfile caches_raw "$caches_file" --rawfile invalid_hosts_raw "$invalid_hosts_file" '
   def status_of($ok; $fetched_at):
     if ($ok != true) then "unreachable"
     elif ($fetched_at == null) then "stale"
     elif ($now - $fetched_at) < $stale_ms then "fresh"
     else "stale" end;
 
-  ($caches | map(
-     (.host // "unknown") as $h
-     | { entry: { host: $h, kind: "remote",
-                  fetched_at: (.fetched_at // null),
-                  age_ms: (if .fetched_at then ($now - .fetched_at) else null end),
-                  status: status_of(.ok; .fetched_at),
-                  error: (.error // null) },
-         rows: ((.payload.sessions // []) | map(. + {host: $h})) }
-   )) as $remote
-  | ($invalid_hosts | map({
+  # Sanitiser for every remote-sourced string, applied HERE because the
+  # remote producer is exactly the thing we cannot trust to have done it
+  # itself. Idempotent: unescape the entities this itself produces back to
+  # raw characters before re-escaping, so a value that already went through
+  # this (or the identical `clean` in claude-sessions, e.g. a remote row
+  # cleaned once by its own machine) never gets double-escaped -- "&amp;"
+  # stays "&amp;", never becomes "&amp;amp;". Stripping control characters
+  # (which includes \n, \r, \t) is also what stops a remote value from
+  # forging a fake row or host heading in the line-oriented board/tooltip.
+  def clean:
+    if . == null then null
+    else
+      gsub("&amp;"; "&") | gsub("&lt;"; "<") | gsub("&gt;"; ">")
+      | gsub("[[:cntrl:]]"; "")
+      | gsub("&"; "&amp;") | gsub("<"; "&lt;") | gsub(">"; "&gt;")
+    end;
+  def clean_row:
+    . + { name: (.name | clean), cwd: (.cwd | clean), needs: (.needs | clean),
+          status: (.status | clean), state: (.state | clean), host: (.host | clean) };
+  def clean_entry:
+    . + { host: (.host | clean), error: (.error | clean) };
+
+  # A remote is a trust boundary: its cached response can be malformed --
+  # not an object at all, or a `.sessions` that is not an array of objects.
+  # Order matters below: each `and`/`or` only reaches its right side once
+  # the left has already narrowed the type (jq boolean operators
+  # short-circuit), so this never raises a jq type error on the wrong shape
+  # -- a bad shape is simply treated as invalid, exactly like a cache file
+  # that failed to parse as JSON at all.
+  def payload_valid:
+    (type == "object")
+    and ((.sessions // []) | type == "array")
+    and ((.sessions // []) | all(type == "object"));
+  def entry_valid:
+    (type == "object")
+    and (.fetched_at == null or (.fetched_at | type) == "number")
+    and (.payload == null or (.payload | payload_valid));
+  def safe_host:
+    if (type == "object") then (.host // "unknown") else "unknown" end;
+
+  ($caches_raw | fromjson) as $caches
+  | ($invalid_hosts_raw | rtrimstr("\n")
+     | (if length == 0 then [] else split("\n") end)) as $corrupt_hosts
+
+  | ($caches | map(
+       if entry_valid then
+         (.host // "unknown") as $h
+         | { entry: { host: $h, kind: "remote",
+                      fetched_at: (.fetched_at // null),
+                      age_ms: (if .fetched_at then ($now - .fetched_at) else null end),
+                      status: status_of(.ok; .fetched_at),
+                      error: (.error // null) },
+             rows: ((.payload.sessions // []) | map(. + {host: $h})) }
+       else
+         { entry: { host: safe_host, kind: "remote", fetched_at: null, age_ms: null,
+                     status: "unreachable", error: "invalid payload shape" },
+           rows: [] }
+       end
+     )) as $remote
+  | ($corrupt_hosts | map({
        entry: { host: ., kind: "remote", fetched_at: null, age_ms: null,
                 status: "unreachable", error: "corrupt cache" },
        rows: [] })) as $corrupt
@@ -96,8 +154,9 @@ merged=$(jq -n \
   | { host: $local_host, generated_at: $now, degraded: $degraded, unreadable: $unreadable,
       hosts: ([{ host: $local_host, kind: "local", fetched_at: $local_generated_at,
                   age_ms: 0, status: "fresh", error: null }]
-              + ($all | map(.entry))),
-      sessions: ($local_sessions + ($all | map(.rows) | add // [])) }')
+              + ($all | map(.entry | clean_entry))),
+      sessions: ($local_sessions + ($all | map(.rows) | add // [] | map(clean_row))) }')
+rm -f "$caches_file" "$invalid_hosts_file"
 
 # --- trigger a refresh, never blocking on it --------------------------
 # Only when there is somewhere to fetch from: a fresh install or a plain
