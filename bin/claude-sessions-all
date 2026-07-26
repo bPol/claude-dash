@@ -40,6 +40,16 @@ local_unreadable=${local_fields[3]:-}
 local_sessions=$(jq -c --arg h "$local_host" \
   '[ (.sessions // [])[] | . + {host:$h} ]' <<<"$local_out")
 
+# Carried through a FILE, never a bash variable fed to --argjson, for the
+# exact same reason the remote cache content is (see below): a local
+# producer can legitimately have hundreds of sessions, and --argjson's value
+# goes through argv, which is bounded by ARG_MAX/MAX_ARG_STRLEN (~128KB per
+# single argument) well before that many sessions' worth of JSON gets large.
+# Only the remote path had this fix before; the local path hit the identical
+# "Argument list too long" failure, just needing more sessions to trigger it.
+local_sessions_file=$(mktemp "${TMPDIR:-/tmp}/claude-dash-localsessions.XXXXXX")
+printf '%s' "$local_sessions" >"$local_sessions_file"
+
 # --- remote rows: every cache file, whatever the current hosts list says --
 shopt -s nullglob
 cache_files=("$CACHE_DIR"/*.json)
@@ -79,9 +89,10 @@ merged=$(jq -n \
   --argjson degraded "${local_degraded:-false}" \
   --argjson unreadable "${local_unreadable:-0}" \
   --argjson stale_ms "$((STALE_AFTER * 1000))" \
-  --argjson local_sessions "$local_sessions" \
+  --rawfile local_sessions_raw "$local_sessions_file" \
   --rawfile caches_raw "$caches_file" --rawfile invalid_hosts_raw "$invalid_hosts_file" '
-  def status_of($ok; $fetched_at):
+  ($local_sessions_raw | fromjson) as $local_sessions
+  | def status_of($ok; $fetched_at):
     if ($ok != true) then "unreachable"
     elif ($fetched_at == null) then "stale"
     elif ($now - $fetched_at) < $stale_ms then "fresh"
@@ -186,7 +197,7 @@ merged=$(jq -n \
                   age_ms: 0, status: "fresh", error: null }]
               + ($all | map(.entry | clean_entry))),
       sessions: ($local_sessions + ($all | map(.rows) | add // [] | map(clean_row))) }')
-rm -f "$caches_file" "$invalid_hosts_file"
+rm -f "$local_sessions_file" "$caches_file" "$invalid_hosts_file"
 
 # --- trigger a refresh, never blocking on it --------------------------
 # Only when there is somewhere to fetch from: a fresh install or a plain

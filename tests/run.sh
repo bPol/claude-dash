@@ -1305,6 +1305,37 @@ check "a literal '&amp;lt;' name is preserved verbatim, not decoded" \
   "$(jq -r '[.sessions[] | select(.host=="literal-entity-text")][0].name' <<<"$out")" '&amp;lt;'
 rm -rf "$(dirname "$lp")" "$root"
 
+# --- finding 2 (IMPORTANT): the LOCAL payload is still on argv --------------
+# --argjson local_sessions "$local_sessions" breaks past ARG_MAX (~128KB per
+# arg / MAX_ARG_STRLEN), well before the overall 1MiB-per-remote cap even
+# applies -- because the local path never went through the same fix the
+# remote path got. Built directly into the stub producer's own script (never
+# through a bash function argument fed to --argjson), matching how the
+# existing big-remote-payload test avoids the exact same trap in its own
+# fixture builder.
+root=$(new_root)
+cache=$root/cache
+mkdir -p "$cache"
+d=$(mktemp -d "${TMPDIR:-/tmp}/claude-dash-biglocal.XXXXXX")
+big_local_sessions_file=$(mktemp "${TMPDIR:-/tmp}/claude-dash-biglocalsessions.XXXXXX")
+jq -c -n '[range(2500) | {kind:"bg",pid:null,name:("local row " + (. | tostring) + (" x" * 100)),cwd:"/y",status:"idle",working:false,state:null,needs:null,idle_ms:1000,job_id:null,finished:false}]' \
+  >"$big_local_sessions_file"
+jq -n --rawfile sessions_raw "$big_local_sessions_file" \
+  '{host:"biglocal", generated_at:0, degraded:false, unreadable:0, sessions:($sessions_raw | fromjson)}' \
+  >"$d/payload.json"
+printf '#!/usr/bin/env bash\ncat "%s/payload.json"\n' "$d" >"$d/producer"
+chmod +x "$d/producer"
+rm -f "$big_local_sessions_file"
+printf '  .. big-local-payload fixture size: %s bytes\n' "$(wc -c <"$d/payload.json")"
+out=$(CLAUDE_DASH_LOCAL_PRODUCER="$d/producer" CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_HOSTS=$root/no-hosts \
+      "$BIN/claude-sessions-all" 2>"$root/stderr")
+check "a local payload past the historical argv breaking point: exit code is still 0" "$?" "0"
+check "a local payload past the historical argv breaking point: all local rows merged in" \
+  "$(jq -r '[.sessions[] | select(.host == "biglocal")] | length' <<<"$out")" "2500"
+check "a local payload past the historical argv breaking point: no 'Argument list too long' on stderr" \
+  "$(grep -c 'Argument list too long' "$root/stderr" || true)" "0"
+rm -rf "$d" "$root"
+
 printf '\nclaude-sessions-all: two consumers polling concurrently\n'
 
 # In real use, the badge and the board are two SEPARATE processes, each on
