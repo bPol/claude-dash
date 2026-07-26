@@ -875,6 +875,33 @@ check "a second call inside the rate-limit window does not spawn another fetch" 
   "$(wc -l <"$fetch_log" 2>/dev/null | tr -d ' ')" "1"
 rm -rf "$(dirname "$lp")" "$fetch_stub_dir" "$root"
 
+# install.sh always scaffolds a hosts file (comments and blank lines only) on
+# a fresh single-machine install. Gating the fetch trigger on the file merely
+# EXISTING -- rather than on it containing at least one real host entry --
+# would spawn claude-dash-fetch every poll, forever, on every single-machine
+# install. It must not spawn at all when every line is a comment or blank.
+root=$(new_root)
+cache=$root/cache
+hosts=$root/hosts
+mk_hosts_file "$hosts" "# claude-dash remote hosts, one per line" "" "   " "# workstation"
+lp=$(producer_stub '[]')
+fetch_log=$root/fetch-log
+fetch_stub_dir=$(mktemp -d "${TMPDIR:-/tmp}/claude-dash-fetchstub.XXXXXX")
+cat >"$fetch_stub_dir/fetch" <<STUB
+#!/usr/bin/env bash
+printf 'called\n' >>"$fetch_log"
+STUB
+chmod +x "$fetch_stub_dir/fetch"
+CLAUDE_DASH_LOCAL_PRODUCER=$lp CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_HOSTS=$hosts \
+  CLAUDE_DASH_FETCH="$fetch_stub_dir/fetch" CLAUDE_DASH_FETCH_EVERY=20 \
+  "$BIN/claude-sessions-all" >/dev/null
+sleep 0.2
+check "a comments-only hosts file (fresh install scaffold) never spawns a fetch" \
+  "$([[ -f $fetch_log ]] && echo yes || echo no)" "no"
+check "a comments-only hosts file creates no cache dir" \
+  "$([[ -d $cache ]] && echo yes || echo no)" "no"
+rm -rf "$(dirname "$lp")" "$fetch_stub_dir" "$root"
+
 printf '\nclaude-dash-badge\n'
 
 p=$(producer_stub '[

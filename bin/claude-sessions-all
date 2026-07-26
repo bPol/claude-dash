@@ -101,8 +101,22 @@ merged=$(jq -n \
 
 # --- trigger a refresh, never blocking on it --------------------------
 # Only when there is somewhere to fetch from: a fresh install or a plain
-# single-machine setup with no hosts file must cost nothing extra here.
+# single-machine setup must cost nothing extra here. install.sh always
+# scaffolds a hosts file (comments and blank lines only), so gating on the
+# file merely EXISTING would spawn claude-dash-fetch every poll forever on a
+# single-machine install -- gate on there being at least one parsed entry
+# instead. Mirrors claude-dash-fetch's own read_hosts_file: strip a trailing
+# "#" comment, trim surrounding whitespace, count what is left.
+host_count=0
 if [[ -f $HOSTS_FILE ]]; then
+  while IFS= read -r hline || [[ -n $hline ]]; do
+    hline=${hline%%#*}
+    hline="${hline#"${hline%%[![:space:]]*}"}"
+    hline="${hline%"${hline##*[![:space:]]}"}"
+    [[ -n $hline ]] && host_count=$((host_count + 1))
+  done <"$HOSTS_FILE"
+fi
+if ((host_count > 0)); then
   newest=0
   for f in "${cache_files[@]}"; do
     mt=$(stat -c %Y "$f" 2>/dev/null || printf '0')
