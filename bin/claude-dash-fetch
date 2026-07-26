@@ -43,11 +43,14 @@ target_of() {
 
 # host_of ENTRY -- "user@host[=cmd]" or "host[=cmd]" -> "host". Used for the
 # cache filename and every label shown to the user; the login user never
-# appears.
+# appears. A hosts-file entry is meant to be a bare hostname, but nothing
+# stops a crafted one from carrying "/" -- strip it so the result can never
+# turn the cache filename into a path that writes outside CACHE_DIR.
 host_of() {
-  local target
+  local target host
   target=$(target_of "$1")
-  printf '%s' "${target##*@}"
+  host=${target##*@}
+  printf '%s' "${host//\//_}"
 }
 
 # remote_cmd_of ENTRY -- the per-host remote command override, or empty if

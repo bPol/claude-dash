@@ -609,6 +609,22 @@ check "user@host's login user is not in the recorded host field" \
   "$(jq -r '.host' "$cache/ok-host.json")" "ok-host"
 rm -rf "$root"
 
+# A hosts-file entry is meant to be a bare hostname, but nothing stops it
+# from carrying "/" -- host_of must not let that write a cache file outside
+# CACHE_DIR. "../escaped-host" as an entry, with no directory of its own name
+# inside the cache dir, would otherwise resolve one level up.
+root=$(new_root)
+cache=$root/cache
+hosts=$root/hosts
+mk_hosts_file "$hosts" "../escaped-host"
+CLAUDE_DASH_HOSTS=$hosts CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_SSH=$SSH_STUB \
+  "$BIN/claude-dash-fetch"
+check "a hosts entry containing / cannot write its cache file outside the cache dir" \
+  "$([[ -f $root/escaped-host.json ]] && echo yes || echo no)" "no"
+check "a hosts entry containing / has its slash sanitised out of the cache filename" \
+  "$([[ -f $cache/.._escaped-host.json ]] && echo yes || echo no)" "yes"
+rm -rf "$root"
+
 # Comments and blank lines in the hosts file are ignored, and a genuinely
 # empty/absent hosts file fetches nothing (no error, no cache files).
 root=$(new_root)
