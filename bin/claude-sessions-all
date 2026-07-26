@@ -25,8 +25,17 @@ if [[ -z $local_out ]] || ! jq -e . >/dev/null 2>&1 <<<"$local_out"; then
     '{host:$host, generated_at:$now, degraded:true, unreadable:0, sessions:[]}')
 fi
 
-read -r local_host local_generated_at local_degraded local_unreadable \
-  < <(jq -r '[.host, .generated_at, .degraded, .unreadable] | @tsv' <<<"$local_out")
+# One field per line, not @tsv -- @tsv joins with a literal tab, and `read`'s
+# default IFS treats tab as IFS whitespace: a leading empty field (a null
+# .host) collapses away instead of staying an empty first field, shifting
+# every field after it left by one. `.host // ""` also turns a null host into
+# an actual empty line rather than the literal string "null", so the fallback
+# below still triggers correctly.
+mapfile -t local_fields < <(jq -r '.host // "", .generated_at, .degraded, .unreadable' <<<"$local_out")
+local_host=${local_fields[0]:-}
+local_generated_at=${local_fields[1]:-}
+local_degraded=${local_fields[2]:-}
+local_unreadable=${local_fields[3]:-}
 [[ -n $local_host ]] || local_host=${CLAUDE_DASH_HOST:-$(uname -n)}
 local_sessions=$(jq -c --arg h "$local_host" \
   '[ (.sessions // [])[] | . + {host:$h} ]' <<<"$local_out")

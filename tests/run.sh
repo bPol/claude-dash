@@ -702,6 +702,36 @@ check "no cache/no hosts: top-level host matches the local producer's" \
   "$(jq -r '.host' <<<"$out")" "testbox"
 rm -rf "$(dirname "$lp")" "$root"
 
+# A local producer whose `.host` is null must not shift every field after it
+# out of place. `read` over @tsv with the default IFS treats the leading
+# empty (null-host) field as insignificant whitespace and collapses it away,
+# so generated_at lands in $local_host, degraded lands in $local_generated_at,
+# and so on -- one field short by the end. Reproduces the exact corruption
+# from the review: host became the generated_at value, degraded became the
+# unreadable count, and unreadable was lost entirely.
+root=$(new_root)
+cache=$root/cache
+hosts=$root/no-such-hosts-file
+d=$(mktemp -d "${TMPDIR:-/tmp}/claude-dash-nullhost.XXXXXX")
+cat >"$d/producer" <<'STUB'
+#!/usr/bin/env bash
+cat <<'JSON'
+{"host":null,"generated_at":222333,"degraded":true,"unreadable":7,"sessions":[]}
+JSON
+STUB
+chmod +x "$d/producer"
+out=$(CLAUDE_DASH_HOST=fallback-host CLAUDE_DASH_LOCAL_PRODUCER="$d/producer" CLAUDE_DASH_CACHE=$cache \
+      CLAUDE_DASH_HOSTS=$hosts "$BIN/claude-sessions-all")
+check "null local host: top-level host falls back, not shifted from generated_at" \
+  "$(jq -r '.host' <<<"$out")" "fallback-host"
+check "null local host: degraded keeps its real value, not the unreadable count" \
+  "$(jq -r '.degraded' <<<"$out")" "true"
+check "null local host: unreadable keeps its real value, not lost/defaulted" \
+  "$(jq -r '.unreadable' <<<"$out")" "7"
+check "null local host: the hosts entry's fetched_at is the real generated_at" \
+  "$(jq -r '.hosts[0].fetched_at' <<<"$out")" "222333"
+rm -rf "$d" "$root"
+
 # A fresh remote cache merges in and is labelled with its host.
 root=$(new_root)
 cache=$root/cache
