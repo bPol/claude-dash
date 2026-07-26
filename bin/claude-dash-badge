@@ -2,7 +2,11 @@
 # waybar custom module: one line of JSON summarising local Claude Code sessions.
 set -uo pipefail
 
-HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# Resolve symlinks: these scripts are normally invoked through ~/.local/bin
+# symlinks, and a sibling lookup there finds only what install.sh has linked.
+# Resolving to the real directory means a stale install cannot break the
+# dashboard by hiding a script that exists in the repo.
+HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")")" && pwd)
 PRODUCER=${CLAUDE_DASH_PRODUCER:-$HERE/claude-sessions-all}
 
 fail() {
