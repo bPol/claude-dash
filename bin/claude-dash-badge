@@ -14,12 +14,17 @@ data=$("$PRODUCER" 2>/dev/null) || fail "claude-dash: producer failed"
 [[ -n $data ]] || fail "claude-dash: producer returned nothing"
 
 jq -c -r '
+  # A backwards clock step (NTP correction, suspend/resume drift) can make a
+  # fetched_at/updatedAt look like it is in the future, yielding a negative
+  # duration -- clamp at 0 rather than render a nonsensical "-3600s ago".
   def age:
     if . == null then "—"
-    elif . < 60000 then "\((. / 1000 | floor))s"
-    elif . < 3600000 then "\((. / 60000 | floor))m"
-    elif . < 86400000 then "\((. / 3600000 | floor))h"
-    else "\((. / 86400000 | floor))d" end;
+    else ([., 0] | max) as $ms
+    | if $ms < 60000 then "\(($ms / 1000 | floor))s"
+      elif $ms < 3600000 then "\(($ms / 60000 | floor))m"
+      elif $ms < 86400000 then "\(($ms / 3600000 | floor))h"
+      else "\(($ms / 86400000 | floor))d" end
+    end;
 
   # Counts are over ALL hosts, local and remote alike -- a blocked agent on a
   # remote machine turns this badge amber exactly like a local one would.

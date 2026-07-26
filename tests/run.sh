@@ -1035,6 +1035,20 @@ check "an unreachable remote still shows its last-known row" \
   "$(jq -r '.tooltip | contains("last known on down-pc")' <<<"$out")" "true"
 rm -rf "$(dirname "$p")"
 
+# A backwards clock step (NTP correction, suspend/resume drift) can make a
+# fetched_at look like it is in the future, yielding a negative age_ms. That
+# must render as "now", not a nonsensical negative duration.
+p=$(multi_producer_stub \
+  '[{"host":"local-box","kind":"local","fetched_at":0,"age_ms":0,"status":"fresh","error":null},
+    {"host":"time-skewed-pc","kind":"remote","fetched_at":0,"age_ms":-3600000,"status":"stale","error":null}]' \
+  '[]')
+out=$(CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash-badge")
+check "a negative age_ms (backwards clock step) is not rendered as -3600s ago" \
+  "$(jq -r '.tooltip | contains("-3600s")' <<<"$out")" "false"
+check "a negative age_ms clamps to 0s ago rather than being dropped" \
+  "$(jq -r '.tooltip | contains("0s ago")' <<<"$out")" "true"
+rm -rf "$(dirname "$p")"
+
 # A machine that has been unreachable for hours keeps its last-known rows in
 # the cache -- including a blocked one -- but those rows are stale
 # information, not live state. They must not pin the badge amber on
@@ -1169,6 +1183,19 @@ check "counts sum across every host, not just local" \
      | grep -oE '[0-9]+' | awk '{s+=$1} END{print s+0}')" "4"
 check "multi-host frame still respects the terminal width" \
   "$(awk 'length > 100' <<<"$frame" | wc -l)" "0"
+rm -rf "$(dirname "$p")"
+
+# Same backwards-clock-step guard as the badge: a negative age_ms must clamp
+# at 0, not print as a nonsensical negative duration in the board's heading.
+p=$(multi_producer_stub \
+  '[{"host":"local-box","kind":"local","fetched_at":0,"age_ms":0,"status":"fresh","error":null},
+    {"host":"time-skewed-pc","kind":"remote","fetched_at":0,"age_ms":-3600000,"status":"stale","error":null}]' \
+  '[]')
+frame=$(COLUMNS=100 CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash" --once)
+check "board never prints a negative age" \
+  "$(grep -c -- '-3600s' <<<"$frame")" "0"
+check "board clamps a negative age_ms to 0s ago" \
+  "$(grep -c '0s ago' <<<"$frame")" "1"
 rm -rf "$(dirname "$p")"
 
 # A single-host claude-sessions-all-shaped producer (a real remote-configured
