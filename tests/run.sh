@@ -550,6 +550,31 @@ check "a non-JSON response from ssh is not treated as ok" \
   "$(jq -r '.ok' "$cache/badjson-host.json")" "false"
 rm -rf "$root"
 
+# A remote is a trust boundary: valid JSON whose .sessions is not an array of
+# objects must be rejected exactly like invalid JSON, never cached as
+# ok:true -- otherwise claude-sessions-all's merge chokes on it later.
+root=$(new_root)
+cache=$root/cache
+hosts=$root/hosts
+mk_hosts_file "$hosts" "wrongshape-host"
+CLAUDE_DASH_HOSTS=$hosts CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_SSH=$SSH_STUB \
+  "$BIN/claude-dash-fetch"
+check "a response whose .sessions is an array of non-objects is not treated as ok" \
+  "$(jq -r '.ok' "$cache/wrongshape-host.json")" "false"
+check "a response whose .sessions is an array of non-objects is not cached as the payload" \
+  "$(jq -r '.payload' "$cache/wrongshape-host.json")" "null"
+rm -rf "$root"
+
+root=$(new_root)
+cache=$root/cache
+hosts=$root/hosts
+mk_hosts_file "$hosts" "wrongshape2-host"
+CLAUDE_DASH_HOSTS=$hosts CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_SSH=$SSH_STUB \
+  "$BIN/claude-dash-fetch"
+check "a response whose .sessions is a string, not an array, is not treated as ok" \
+  "$(jq -r '.ok' "$cache/wrongshape2-host.json")" "false"
+rm -rf "$root"
+
 # A host that was reachable once and then goes down must keep the LAST
 # successful payload in the cache file, not lose it.
 root=$(new_root)

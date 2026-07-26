@@ -47,6 +47,18 @@ JSON
     printf 'not json at all\n'
     exit 0
     ;;
+  wrongshape-host)
+    # Valid JSON, wrong shape: .sessions is an array of numbers, not objects.
+    # A remote is a trust boundary -- this must be rejected exactly like
+    # invalid JSON, never cached as ok:true.
+    printf '{"host":"wrongshape-host","generated_at":1000,"degraded":false,"unreadable":0,"sessions":[1,2,3]}\n'
+    exit 0
+    ;;
+  wrongshape2-host)
+    # Valid JSON, top-level .sessions is a string instead of an array.
+    printf '{"host":"wrongshape2-host","generated_at":1000,"degraded":false,"unreadable":0,"sessions":"nope"}\n'
+    exit 0
+    ;;
   slow-host)
     sleep "${STUB_SSH_SLEEP:-10}"
     cat <<'JSON'

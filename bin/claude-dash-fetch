@@ -11,6 +11,23 @@ CACHE_DIR=${CLAUDE_DASH_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/claude-dash}
 CONNECT_TIMEOUT=${CLAUDE_DASH_FETCH_CONNECT_TIMEOUT:-5}
 OVERALL_TIMEOUT=${CLAUDE_DASH_FETCH_TIMEOUT:-10}
 SSH_BIN=${CLAUDE_DASH_SSH:-ssh}
+# A remote is a trust boundary: its response is data, not truth. Cap what it
+# may contribute (default 1MiB) so one oversized reply cannot blow past
+# ARG_MAX downstream or bloat the cache file without limit; a response over
+# the cap is treated as a failure with an explicit error, same as any other
+# unreachable/invalid response.
+MAX_PAYLOAD_BYTES=${CLAUDE_DASH_MAX_PAYLOAD_BYTES:-1048576}
+# Shape check for a remote response, run before it is ever trusted enough to
+# cache as ok:true: must be a JSON object, and if `.sessions` is present it
+# must be an array of objects -- not an array of scalars, not a string, not
+# an object. Order matters: each `and` only reaches its right side once the
+# left side has already narrowed the type, so this never raises a jq type
+# error on the wrong shape (jq's `and`/`or` short-circuit).
+PAYLOAD_SHAPE_OK='
+  (type == "object")
+  and ((.sessions // []) | type == "array")
+  and ((.sessions // []) | all(type == "object"))
+'
 # The remote's non-interactive PATH is minimal (no ~/.local/bin), so an
 # explicit command is required -- see README's "Aggregating other machines".
 # The tilde below is deliberately unexpanded HERE: it is passed through to
@@ -128,13 +145,24 @@ fetch_one() {
   fi
 
   stderr_file=$(mktemp "${TMPDIR:-/tmp}/claude-dash-fetch-err.XXXXXX")
-  local ok=false error_msg='' payload='null' now prev
+  # The payload is carried through a FILE, never a bash variable fed to
+  # --argjson: a remote response (or a preserved last-known-good payload) can
+  # be arbitrarily large, and --argjson passes its value through argv, which
+  # is bounded by ARG_MAX. A file has no such limit.
+  local payload_file
+  payload_file=$(mktemp "${TMPDIR:-/tmp}/claude-dash-fetch-payload.XXXXXX")
+  printf 'null' >"$payload_file"
+  local ok=false error_msg='' now raw_bytes
   if raw=$(timeout "$OVERALL_TIMEOUT" "$SSH_BIN" \
         -o BatchMode=yes -o ConnectTimeout="$CONNECT_TIMEOUT" \
         -o StrictHostKeyChecking=accept-new \
         "$target" "$remote_cmd" 2>"$stderr_file"); then
-    if [[ -n $raw ]] && jq -e . >/dev/null 2>&1 <<<"$raw"; then
-      payload=$raw
+    raw_bytes=$(printf '%s' "$raw" | wc -c)
+    if ((raw_bytes > MAX_PAYLOAD_BYTES)); then
+      error_msg="response too large (${raw_bytes} bytes, max ${MAX_PAYLOAD_BYTES})"
+    elif [[ -n $raw ]] && jq -e . >/dev/null 2>&1 <<<"$raw" \
+        && jq -e "$PAYLOAD_SHAPE_OK" >/dev/null 2>&1 <<<"$raw"; then
+      printf '%s' "$raw" >"$payload_file"
       ok=true
     else
       error_msg='invalid response'
@@ -148,22 +176,28 @@ fetch_one() {
   if [[ $ok == false && -f $outfile ]]; then
     # Preserve the previous payload on failure so the board still shows
     # last-known rows -- marked stale/unreachable by the reader -- rather
-    # than losing them the moment a single poll fails.
-    prev=$(jq -c '.payload' "$outfile" 2>/dev/null) || prev=''
-    [[ -n $prev && $prev != null ]] && payload=$prev
+    # than losing them the moment a single poll fails. Extracted straight
+    # into a file, never a bash variable, for the same ARG_MAX reason above.
+    if jq -c '.payload' "$outfile" >"$payload_file.prev" 2>/dev/null \
+        && jq -e '. != null' "$payload_file.prev" >/dev/null 2>&1; then
+      mv -f "$payload_file.prev" "$payload_file"
+    else
+      rm -f "$payload_file.prev"
+    fi
   fi
 
   now=$(date +%s%3N)
   tmpfile=$(mktemp "$CACHE_DIR/.$host.XXXXXX")
   if jq -n --arg host "$host" --argjson fetched_at "$now" --argjson ok "$ok" \
-        --arg error "$error_msg" --argjson payload "$payload" \
+        --arg error "$error_msg" --rawfile payload_raw "$payload_file" \
       '{host:$host, fetched_at:$fetched_at, ok:$ok,
-        error:(if $error == "" then null else $error end), payload:$payload}' \
+        error:(if $error == "" then null else $error end), payload:($payload_raw | fromjson)}' \
       >"$tmpfile" 2>/dev/null; then
     mv -f "$tmpfile" "$outfile"
   else
     rm -f "$tmpfile"
   fi
+  rm -f "$payload_file"
 
   flock -u 9
   exec 9>&-
