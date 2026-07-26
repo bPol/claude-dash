@@ -1041,6 +1041,141 @@ check "a comments-only hosts file creates no cache dir" \
   "$([[ -d $cache ]] && echo yes || echo no)" "no"
 rm -rf "$(dirname "$lp")" "$fetch_stub_dir" "$root"
 
+# A remote is a trust boundary: its rows are sanitised only by the REMOTE's
+# own claude-sessions, which is exactly what we cannot trust. Raw markup,
+# an unbalanced tag, and an embedded newline (which could otherwise forge a
+# fake host heading or a fake row in the line-oriented board/tooltip) must
+# all be neutralised here, in the merge, regardless of what the remote sent.
+root=$(new_root)
+cache=$root/cache
+mkdir -p "$cache"
+lp=$(producer_stub '[{"kind":"interactive","pid":1,"name":"local safe","cwd":"/x","status":"idle","working":false,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
+jq -n '{host:"evil-pc",fetched_at:1,ok:true,error:null,
+        payload:{host:"evil-pc",generated_at:1,degraded:false,unreadable:0,
+                 sessions:[
+                   {"kind":"interactive","pid":9,"name":"<b>PWN</b>","cwd":"/y","status":"idle","working":false,"state":null,"needs":null,"idle_ms":1,"job_id":null,"finished":false},
+                   {"kind":"interactive","pid":10,"name":"inject","cwd":"/y","status":"idle","working":false,"state":null,"needs":"<span foreground=\"red\">danger</span>","idle_ms":1,"job_id":null,"finished":false},
+                   {"kind":"bg","pid":null,"name":"unclosed tag","cwd":"/y","status":"idle","working":false,"state":"blocked","needs":"<unclosed","idle_ms":1,"job_id":"j-evil","finished":false},
+                   {"kind":"interactive","pid":11,"name":"line1\nFAKE-HOST\n● busy\tghost","cwd":"/y","status":"idle","working":false,"state":null,"needs":"answer?\nFAKE ROW","idle_ms":1,"job_id":null,"finished":false}
+                 ]}}' \
+  >"$cache/evil-pc.json"
+out=$(CLAUDE_DASH_LOCAL_PRODUCER=$lp CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_HOSTS=$root/no-hosts \
+      "$BIN/claude-sessions-all")
+check "remote markup in .name is escaped, not raw" \
+  "$(jq -r '[.sessions[] | select(.host=="evil-pc")][0].name' <<<"$out")" '&lt;b&gt;PWN&lt;/b&gt;'
+check "remote markup in .needs is escaped, not raw" \
+  "$(jq -r '[.sessions[] | select(.host=="evil-pc")][1].needs' <<<"$out")" \
+  '&lt;span foreground="red"&gt;danger&lt;/span&gt;'
+check "an unbalanced tag in .needs is escaped, never raw markup" \
+  "$(jq -r '[.sessions[] | select(.host=="evil-pc")][2].needs' <<<"$out")" '&lt;unclosed'
+check "a newline embedded in .name cannot forge a fake host heading" \
+  "$(jq -r '[.sessions[] | select(.host=="evil-pc")][3].name | contains("\n")' <<<"$out")" "false"
+check "a newline embedded in .needs cannot forge a fake row" \
+  "$(jq -r '[.sessions[] | select(.host=="evil-pc")][3].needs | contains("\n")' <<<"$out")" "false"
+check "sanitising remote rows leaves the local row untouched" \
+  "$(jq -r '[.sessions[] | select(.name=="local safe")] | length' <<<"$out")" "1"
+rm -rf "$(dirname "$lp")" "$root"
+
+# End-to-end through the badge: the embedded newline from the fixture above
+# must not add a forged line to the rendered tooltip.
+root=$(new_root)
+cache=$root/cache
+mkdir -p "$cache"
+lp=$(producer_stub '[]')
+jq -n '{host:"evil-pc",fetched_at:1,ok:true,error:null,
+        payload:{host:"evil-pc",generated_at:1,degraded:false,unreadable:0,
+                 sessions:[{"kind":"interactive","pid":9,"name":"line1\nFAKE-HOST\n● busy\tghost","cwd":"/y","status":"idle","working":false,"state":null,"needs":null,"idle_ms":1,"job_id":null,"finished":false}]}}' \
+  >"$cache/evil-pc.json"
+out=$(CLAUDE_DASH_PRODUCER="$BIN/claude-sessions-all" CLAUDE_DASH_LOCAL_PRODUCER=$lp \
+      CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_HOSTS=$root/no-hosts "$BIN/claude-dash-badge")
+check "badge tooltip: no forged host heading line from an embedded newline" \
+  "$(jq -r '.tooltip' <<<"$out" | grep -c '^FAKE-HOST$')" "0"
+check "badge tooltip: no forged busy row line from an embedded newline" \
+  "$(jq -r '.tooltip' <<<"$out" | grep -c '^● busy')" "0"
+check "badge tooltip: exactly the real lines, no extra forged ones" \
+  "$(jq -r '.tooltip' <<<"$out" | wc -l | tr -d ' ')" "3"
+rm -rf "$(dirname "$lp")" "$root"
+
+# Idempotence: a remote row that already went through its OWN claude-sessions'
+# `clean` (so its markup is already escaped) must not be escaped a second
+# time here -- "&amp;" must stay "&amp;", never become "&amp;amp;".
+root=$(new_root)
+cache=$root/cache
+mkdir -p "$cache"
+lp=$(producer_stub '[]')
+jq -n '{host:"remote-idem",fetched_at:1,ok:true,error:null,
+        payload:{host:"remote-idem",generated_at:1,degraded:false,unreadable:0,
+                 sessions:[{"kind":"interactive","pid":1,"name":"AT&amp;T rollout","cwd":"/y","status":"idle","working":false,"state":null,"needs":"exit &lt;div&gt; or continue?","idle_ms":1,"job_id":null,"finished":false}]}}' \
+  >"$cache/remote-idem.json"
+out=$(CLAUDE_DASH_LOCAL_PRODUCER=$lp CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_HOSTS=$root/no-hosts \
+      "$BIN/claude-sessions-all")
+check "re-cleaning an already-escaped & does not double-escape (idempotence)" \
+  "$(jq -r '[.sessions[] | select(.host=="remote-idem")][0].name' <<<"$out")" "AT&amp;T rollout"
+check "re-cleaning an already-escaped <div> does not double-escape (idempotence)" \
+  "$(jq -r '[.sessions[] | select(.host=="remote-idem")][0].needs' <<<"$out")" "exit &lt;div&gt; or continue?"
+rm -rf "$(dirname "$lp")" "$root"
+
+# classify_error's "remote error: <stderr>" text is remote-controlled too
+# (the remote chooses what it prints to stderr) -- it must be sanitised the
+# same way as any other remote-sourced string.
+root=$(new_root)
+cache=$root/cache
+mkdir -p "$cache"
+lp=$(producer_stub '[{"kind":"interactive","pid":1,"name":"local ok","cwd":"/x","status":"idle","working":false,"state":null,"needs":null,"idle_ms":1,"job_id":null,"finished":false}]')
+jq -n '{host:"bad-error-host",fetched_at:1,ok:false,
+        error:"remote error: <script>alert(1)</script>\nFAKE LINE",payload:null}' \
+  >"$cache/bad-error-host.json"
+out=$(CLAUDE_DASH_LOCAL_PRODUCER=$lp CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_HOSTS=$root/no-hosts \
+      "$BIN/claude-sessions-all")
+check "classify_error's stderr-derived text is escaped, not raw markup" \
+  "$(jq -r '[.hosts[] | select(.host=="bad-error-host")][0].error | contains("<script>")' <<<"$out")" "false"
+check "classify_error's stderr-derived text cannot inject a newline" \
+  "$(jq -r '[.hosts[] | select(.host=="bad-error-host")][0].error | contains("\n")' <<<"$out")" "false"
+rm -rf "$(dirname "$lp")" "$root"
+
+printf '\nclaude-sessions-all: two consumers polling concurrently\n'
+
+# In real use, the badge and the board are two SEPARATE processes, each on
+# its own poll cycle, each free to call claude-sessions-all at any moment --
+# nothing serialises them. With no cache on disk yet, both can decide "a
+# fetch is due" at the very same instant and each spawn their own
+# claude-dash-fetch. Both consumers must still get back a complete, valid
+# producer output (never a half-written cache file or a crash), and the
+# per-host lock inside claude-dash-fetch must mean only one of the two
+# independently-spawned fetches actually reaches ssh for the host.
+root=$(new_root)
+cache=$root/cache
+hosts=$root/hosts
+mk_hosts_file "$hosts" "ok-host"
+lp=$(producer_stub '[{"kind":"interactive","pid":1,"name":"local task","cwd":"/x","status":"busy","working":true,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
+ssh_log=$root/ssh-log
+: >"$ssh_log"
+out1_file=$root/out1
+out2_file=$root/out2
+STUB_SSH_SLEEP=1 STUB_SSH_LOG=$ssh_log CLAUDE_DASH_LOCAL_PRODUCER=$lp CLAUDE_DASH_CACHE=$cache \
+  CLAUDE_DASH_HOSTS=$hosts CLAUDE_DASH_SSH="$SSH_STUB" CLAUDE_DASH_FETCH="$BIN/claude-dash-fetch" \
+  "$BIN/claude-sessions-all" >"$out1_file" 2>/dev/null &
+p1=$!
+STUB_SSH_SLEEP=1 STUB_SSH_LOG=$ssh_log CLAUDE_DASH_LOCAL_PRODUCER=$lp CLAUDE_DASH_CACHE=$cache \
+  CLAUDE_DASH_HOSTS=$hosts CLAUDE_DASH_SSH="$SSH_STUB" CLAUDE_DASH_FETCH="$BIN/claude-dash-fetch" \
+  "$BIN/claude-sessions-all" >"$out2_file" 2>/dev/null &
+p2=$!
+wait "$p1" "$p2"
+out1=$(<"$out1_file")
+out2=$(<"$out2_file")
+check "two concurrent consumers: the first still returns valid JSON" \
+  "$(jq -e . >/dev/null 2>&1 <<<"$out1" && echo yes || echo no)" "yes"
+check "two concurrent consumers: the second still returns valid JSON" \
+  "$(jq -e . >/dev/null 2>&1 <<<"$out2" && echo yes || echo no)" "yes"
+check "two concurrent consumers: the first still shows the local row" \
+  "$(jq -r '.sessions | map(select(.name=="local task")) | length' <<<"$out1")" "1"
+check "two concurrent consumers: the second still shows the local row" \
+  "$(jq -r '.sessions | map(select(.name=="local task")) | length' <<<"$out2")" "1"
+sleep 1.5   # let the detached, independently-spawned fetch(es) finish
+check "two consumers racing to spawn a fetch: only one ssh call reaches the host" \
+  "$(wc -l <"$ssh_log" | tr -d ' ')" "1"
+rm -rf "$(dirname "$lp")" "$root"
+
 printf '\nclaude-dash-badge\n'
 
 p=$(producer_stub '[
