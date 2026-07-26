@@ -102,7 +102,12 @@ fi
 JQ_CLEAN_DEF='
 def clean:
   if . == null then null
-  else gsub("[[:cntrl:]]"; "")
+  # [[:cntrl:]] strips \n \r \t and NEL (U+0085); U+2028 LINE SEPARATOR and
+  # U+2029 PARAGRAPH SEPARATOR sit outside that POSIX class but Pango still
+  # treats them as a mandatory line break, so they are stripped in the same
+  # pass -- the local registry is trusted for CONTENT, never for whether it
+  # can forge an extra rendered line.
+  else gsub("[[:cntrl:]  ]"; "")
        | gsub("&"; "&amp;") | gsub("<"; "&lt;") | gsub(">"; "&gt;")
   end;
 def rank:

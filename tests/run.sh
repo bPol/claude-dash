@@ -1176,6 +1176,135 @@ check "classify_error's stderr-derived text cannot inject a newline" \
   "$(jq -r '[.hosts[] | select(.host=="bad-error-host")][0].error | contains("\n")' <<<"$out")" "false"
 rm -rf "$(dirname "$lp")" "$root"
 
+printf '\nclaude-sessions-all: second review findings\n'
+
+# --- finding 1 (CRITICAL): type confusion, not just shape confusion --------
+# payload_valid/entry_valid only ever checked SHAPE (object vs array vs
+# string). A session object can pass every shape check while a field `clean`
+# later gsubs on (.name/.cwd/.needs/.status/.state/.host, or the hosts-entry
+# .error) carries the wrong JSON TYPE -- a number, an array, an object. Before
+# the fix this crashed jq mid-gsub ("... cannot be matched, as it is not a
+# string"), which failed the WHOLE `jq -n` invocation: zero bytes on stdout,
+# not just a lost remote row -- local rows vanished too.
+root=$(new_root)
+cache=$root/cache
+mkdir -p "$cache"
+lp=$(producer_stub '[{"kind":"interactive","pid":1,"name":"local survives badtype","cwd":"/x","status":"busy","working":true,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
+jq -n '{host:"badtype-remote",fetched_at:1,ok:true,error:null,
+        payload:{host:"badtype-remote",generated_at:1,degraded:false,unreadable:0,
+                 sessions:[{"kind":"bg","pid":null,"name":123,"cwd":"/y","status":"idle","working":false,"state":null,"needs":[],"idle_ms":1,"job_id":null,"finished":false}]}}' \
+  >"$cache/badtype-remote.json"
+out=$(CLAUDE_DASH_LOCAL_PRODUCER=$lp CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_HOSTS=$root/no-hosts \
+      "$BIN/claude-sessions-all")
+check "a numeric remote .name: exit code is still 0" "$?" "0"
+check "a numeric remote .name: output is still valid JSON" \
+  "$(jq -e . >/dev/null 2>&1 <<<"$out" && echo yes || echo no)" "yes"
+check "a numeric remote .name: local row survives" \
+  "$(jq -r '[.sessions[] | select(.name == "local survives badtype")] | length' <<<"$out")" "1"
+check "a numeric remote .name: renders as its string form, not raw" \
+  "$(jq -r '[.sessions[] | select(.host == "badtype-remote")][0].name' <<<"$out")" "123"
+check "an array remote .needs: renders as a harmless placeholder, not raw" \
+  "$(jq -r '[.sessions[] | select(.host == "badtype-remote")][0].needs | type' <<<"$out")" "string"
+rm -rf "$(dirname "$lp")" "$root"
+
+# Same principle at the cache-ENTRY level: a numeric .host (the field used to
+# tag every row from that container and to label it in `hosts[]`) must not
+# crash the merge either -- entry-level fields are exactly as untrustworthy
+# as payload fields, since the cache file can be hand-edited or written by an
+# older/buggy version of claude-dash-fetch.
+root=$(new_root)
+cache=$root/cache
+mkdir -p "$cache"
+lp=$(producer_stub '[{"kind":"interactive","pid":1,"name":"local survives numeric host","cwd":"/x","status":"busy","working":true,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
+jq -n '{host:123,fetched_at:1,ok:true,error:null,
+        payload:{host:123,generated_at:1,degraded:false,unreadable:0,sessions:[]}}' \
+  >"$cache/numerichost.json"
+out=$(CLAUDE_DASH_LOCAL_PRODUCER=$lp CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_HOSTS=$root/no-hosts \
+      "$BIN/claude-sessions-all")
+check "a numeric cache-entry .host: exit code is still 0" "$?" "0"
+check "a numeric cache-entry .host: output is still valid JSON" \
+  "$(jq -e . >/dev/null 2>&1 <<<"$out" && echo yes || echo no)" "yes"
+check "a numeric cache-entry .host: local row survives" \
+  "$(jq -r '[.sessions[] | select(.name == "local survives numeric host")] | length' <<<"$out")" "1"
+check "a numeric cache-entry .host: the hosts entry renders it as a string" \
+  "$(jq -r '[.hosts[] | select(.host == "123")] | length' <<<"$out")" "1"
+rm -rf "$(dirname "$lp")" "$root"
+
+# And a non-string .error on a failed host -- another field `clean_entry`
+# gsubs on.
+root=$(new_root)
+cache=$root/cache
+mkdir -p "$cache"
+lp=$(producer_stub '[{"kind":"interactive","pid":1,"name":"local survives object error","cwd":"/x","status":"busy","working":true,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
+jq -n '{host:"objecterror-host",fetched_at:1,ok:false,error:{},payload:null}' \
+  >"$cache/objecterror-host.json"
+out=$(CLAUDE_DASH_LOCAL_PRODUCER=$lp CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_HOSTS=$root/no-hosts \
+      "$BIN/claude-sessions-all")
+check "an object .error: exit code is still 0" "$?" "0"
+check "an object .error: output is still valid JSON" \
+  "$(jq -e . >/dev/null 2>&1 <<<"$out" && echo yes || echo no)" "yes"
+check "an object .error: local row survives" \
+  "$(jq -r '[.sessions[] | select(.name == "local survives object error")] | length' <<<"$out")" "1"
+check "an object .error: the hosts entry's error is a harmless string placeholder, not raw" \
+  "$(jq -r '[.hosts[] | select(.host == "objecterror-host")][0].error | type' <<<"$out")" "string"
+rm -rf "$(dirname "$lp")" "$root"
+# --- finding 3 (IMPORTANT): U+2028/U+2029 still forge rows ------------------
+# gsub("[[:cntrl:]]";"") strips \n \r \t and U+0085, but NOT U+2028 (LINE
+# SEPARATOR) or U+2029 (PARAGRAPH SEPARATOR) -- both of which Pango treats as
+# a mandatory line break, so a remote can still forge a fake row/heading with
+# them exactly as it could with a raw "\n" before finding 3 was first closed.
+root=$(new_root)
+cache=$root/cache
+mkdir -p "$cache"
+lp=$(producer_stub '[{"kind":"interactive","pid":1,"name":"local safe from line-sep","cwd":"/x","status":"idle","working":false,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
+jq -n '{host:"lineattack",fetched_at:1,ok:true,error:null,
+        payload:{host:"lineattack",generated_at:1,degraded:false,unreadable:0,
+                 sessions:[{"kind":"interactive","pid":9,"name":"line1 FAKE-HOST","cwd":"/y","status":"idle","working":false,"state":null,"needs":"answer? FAKE ROW","idle_ms":1,"job_id":null,"finished":false}]}}' \
+  >"$cache/lineattack.json"
+out=$(CLAUDE_DASH_LOCAL_PRODUCER=$lp CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_HOSTS=$root/no-hosts \
+      "$BIN/claude-sessions-all")
+check "U+2028 embedded in remote .name does not survive into the merge" \
+  "$(jq -r '[.sessions[] | select(.host=="lineattack")][0].name | contains(" ")' <<<"$out")" "false"
+check "U+2029 embedded in remote .needs does not survive into the merge" \
+  "$(jq -r '[.sessions[] | select(.host=="lineattack")][0].needs | contains(" ")' <<<"$out")" "false"
+rm -rf "$(dirname "$lp")" "$root"
+
+# End-to-end through the badge: same fixture, proving U+2028 cannot forge a
+# rendered tooltip line the way finding 3 already proved for a raw "\n".
+root=$(new_root)
+cache=$root/cache
+mkdir -p "$cache"
+lp=$(producer_stub '[]')
+jq -n '{host:"lineattack2",fetched_at:1,ok:true,error:null,
+        payload:{host:"lineattack2",generated_at:1,degraded:false,unreadable:0,
+                 sessions:[{"kind":"interactive","pid":9,"name":"line1 FAKE-HOST","cwd":"/y","status":"idle","working":false,"state":null,"needs":null,"idle_ms":1,"job_id":null,"finished":false}]}}' \
+  >"$cache/lineattack2.json"
+out=$(CLAUDE_DASH_PRODUCER="$BIN/claude-sessions-all" CLAUDE_DASH_LOCAL_PRODUCER=$lp \
+      CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_HOSTS=$root/no-hosts "$BIN/claude-dash-badge")
+check "badge tooltip: no U+2028 reaches the rendered tooltip text" \
+  "$(jq -r '.tooltip | contains(" ")' <<<"$out")" "false"
+rm -rf "$(dirname "$lp")" "$root"
+
+# --- finding 5 (MINOR): the unescape-before-escape step is lossy ------------
+# A legitimate name containing the literal TEXT "&amp;lt;" (not an entity
+# produced by our own escaping, just a user/remote typing those characters)
+# must survive unchanged -- unescaping it first and re-escaping second turns
+# it into "&lt;" (renders as a literal "<"), silently corrupting content that
+# was never dangerous to begin with.
+root=$(new_root)
+cache=$root/cache
+mkdir -p "$cache"
+lp=$(producer_stub '[]')
+jq -n '{host:"literal-entity-text",fetched_at:1,ok:true,error:null,
+        payload:{host:"literal-entity-text",generated_at:1,degraded:false,unreadable:0,
+                 sessions:[{"kind":"interactive","pid":9,"name":"&amp;lt;","cwd":"/y","status":"idle","working":false,"state":null,"needs":null,"idle_ms":1,"job_id":null,"finished":false}]}}' \
+  >"$cache/literal-entity-text.json"
+out=$(CLAUDE_DASH_LOCAL_PRODUCER=$lp CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_HOSTS=$root/no-hosts \
+      "$BIN/claude-sessions-all")
+check "a literal '&amp;lt;' name is preserved verbatim, not decoded" \
+  "$(jq -r '[.sessions[] | select(.host=="literal-entity-text")][0].name' <<<"$out")" '&amp;lt;'
+rm -rf "$(dirname "$lp")" "$root"
+
 printf '\nclaude-sessions-all: two consumers polling concurrently\n'
 
 # In real use, the badge and the board are two SEPARATE processes, each on

@@ -87,22 +87,52 @@ merged=$(jq -n \
     elif ($now - $fetched_at) < $stale_ms then "fresh"
     else "stale" end;
 
+  # A remote JSON payload is a trust boundary in TYPE as well as in VALUE:
+  # shape validation (payload_valid/entry_valid below) only ever proved a
+  # field exists in roughly the right container, never that e.g. `.name` is
+  # actually a string. `clean` gsubs several fields unconditionally, and
+  # gsub raises a hard type error on anything but a string -- so a bad type
+  # reaching it (a number, an array, an object) must never be possible: this
+  # is the ONE place every remote-sourced field passes through before that
+  # happens, coercing anything else into a safe string first. Numbers/
+  # booleans render as their ordinary string form; an array/object (never
+  # legitimately expected here) becomes a harmless fixed placeholder instead
+  # of throwing. null stays null -- every field this feeds is nullable in the
+  # output schema.
+  def stringify:
+    if . == null then null
+    elif type == "string" then .
+    elif type == "number" or type == "boolean" then tostring
+    else "[invalid value]"
+    end;
+
   # Sanitiser for every remote-sourced string, applied HERE because the
   # remote producer is exactly the thing we cannot trust to have done it
-  # itself. Idempotent: unescape the entities this itself produces back to
-  # raw characters before re-escaping, so a value that already went through
-  # this (or the identical `clean` in claude-sessions, e.g. a remote row
-  # cleaned once by its own machine) never gets double-escaped -- "&amp;"
-  # stays "&amp;", never becomes "&amp;amp;". Stripping control characters
-  # (which includes \n, \r, \t) is also what stops a remote value from
-  # forging a fake row or host heading in the line-oriented board/tooltip.
+  # itself. Idempotent WITHOUT a lossy unescape/re-escape round trip: a
+  # legitimate value that happens to contain the literal text "&amp;lt;"
+  # (never itself run through this escaping) must survive unchanged, which
+  # unescaping-then-re-escaping cannot guarantee -- it would decode that
+  # literal text into "&lt;", rendering as "<". Instead, only escape an "&"
+  # that does NOT already begin one of the three entities this function
+  # itself produces (a negative lookahead) -- an "&" already part of "&amp;",
+  # "&lt;" or "&gt;" is left alone, so re-running this on already-clean text
+  # (already the output of this same function, or the identical `clean` in
+  # claude-sessions on a remote row cleaned once by its own machine) is a
+  # true no-op, and raw "<"/">" are always escaped unconditionally (a value
+  # already escaped never contains a raw angle bracket to double-encode).
+  # Stripping control characters (\n \r \t and NEL U+0085, via [[:cntrl:]])
+  # plus the two Unicode line-breaking characters outside that class -- U+2028
+  # LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR, both of which Pango treats
+  # as a mandatory line break -- is what stops a remote value from forging a
+  # fake row or host heading in the line-oriented board/tooltip.
   def clean:
-    if . == null then null
-    else
-      gsub("&amp;"; "&") | gsub("&lt;"; "<") | gsub("&gt;"; ">")
-      | gsub("[[:cntrl:]]"; "")
-      | gsub("&"; "&amp;") | gsub("<"; "&lt;") | gsub(">"; "&gt;")
-    end;
+    stringify
+    | if . == null then null
+      else
+        gsub("[[:cntrl:]  ]"; "")
+        | gsub("&(?!(amp|lt|gt);)"; "&amp;")
+        | gsub("<"; "&lt;") | gsub(">"; "&gt;")
+      end;
   def clean_row:
     . + { name: (.name | clean), cwd: (.cwd | clean), needs: (.needs | clean),
           status: (.status | clean), state: (.state | clean), host: (.host | clean) };
