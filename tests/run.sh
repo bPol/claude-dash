@@ -1371,6 +1371,92 @@ check "claude-sessions' sanitised host still carries the non-control text" \
   "$(jq -r '.host' <<<"$out")" "evilhost"
 rm -rf "$root"
 
+# --- required fuzz-ish property test: the merge must NEVER emit zero bytes,
+# for ANY cache-file input. Six deliberately malformed fixtures, one per
+# required category (wrong types, wrong shapes, huge, empty, binary garbage,
+# deeply nested), each fed to the merge ALONE in its own fresh cache dir so a
+# failure on one can never be masked or caused by another. Every single one
+# must still yield a still-running exit code, non-empty stdout, PARSEABLE
+# JSON, and the local row inside it.
+fuzz_assert() {   # fuzz_assert LABEL CACHE_DIR LOCAL_PRODUCER
+  local label=$1 cache=$2 lp=$3 out rc
+  out=$(CLAUDE_DASH_LOCAL_PRODUCER=$lp CLAUDE_DASH_CACHE=$cache \
+        CLAUDE_DASH_HOSTS=$root/no-hosts "$BIN/claude-sessions-all" 2>/dev/null)
+  rc=$?
+  check "fuzz [$label]: exit code is still 0" "$rc" "0"
+  check "fuzz [$label]: output is never empty" \
+    "$([[ -n $out ]] && echo nonempty || echo empty)" "nonempty"
+  check "fuzz [$label]: output is still parseable JSON" \
+    "$(jq -e . >/dev/null 2>&1 <<<"$out" && echo yes || echo no)" "yes"
+  check "fuzz [$label]: local rows are still present" \
+    "$(jq -r '[.sessions[] | select(.name == "fuzz local row")] | length' <<<"$out")" "1"
+}
+
+root=$(new_root)
+lp=$(producer_stub '[{"kind":"interactive","pid":1,"name":"fuzz local row","cwd":"/x","status":"busy","working":true,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
+
+# 1. wrong types: every remote-sourced field is the wrong JSON type at once.
+cache=$root/cache-wrongtypes
+mkdir -p "$cache"
+jq -n '{host:{},fetched_at:1,ok:true,error:["not","a","string"],
+        payload:{host:{},generated_at:null,degraded:"nope",unreadable:[1,2],
+                 sessions:[{"kind":1,"pid":"x","name":{},"cwd":[1],"status":true,
+                            "working":"maybe","state":5,"needs":{},"idle_ms":"n",
+                            "job_id":false,"finished":"no"}]}}' \
+  >"$cache/wrongtypes.json"
+fuzz_assert "wrong types" "$cache" "$lp"
+
+# 2. wrong shapes: the cache file is syntactically valid JSON but a bare
+# scalar at the top level, not an object at all.
+cache=$root/cache-wrongshape
+mkdir -p "$cache"
+printf 'true' >"$cache/wrongshape.json"
+fuzz_assert "wrong shapes" "$cache" "$lp"
+
+# 3. huge: a multi-megabyte cache file, well past the fetch-side size cap
+# (which only bounds a FRESH fetch, never an already-written cache file).
+cache=$root/cache-huge
+mkdir -p "$cache"
+huge_sessions_file=$(mktemp "${TMPDIR:-/tmp}/claude-dash-fuzzhuge.XXXXXX")
+jq -c -n '[range(5000) | {kind:"bg",pid:null,name:("row " + (. | tostring) + (" x" * 200)),cwd:"/y",status:"idle",working:false,state:null,needs:null,idle_ms:1,job_id:null,finished:false}]' \
+  >"$huge_sessions_file"
+jq -n --rawfile s "$huge_sessions_file" \
+  '{host:"huge",fetched_at:1,ok:true,error:null,
+    payload:{host:"huge",generated_at:1,degraded:false,unreadable:0,sessions:($s|fromjson)}}' \
+  >"$cache/huge.json"
+rm -f "$huge_sessions_file"
+fuzz_assert "huge" "$cache" "$lp"
+
+# 4. empty: a zero-byte cache file.
+cache=$root/cache-empty
+mkdir -p "$cache"
+printf '' >"$cache/empty.json"
+fuzz_assert "empty" "$cache" "$lp"
+
+# 5. binary garbage: random bytes, almost certainly not valid JSON/UTF-8.
+cache=$root/cache-garbage
+mkdir -p "$cache"
+head -c 4096 /dev/urandom >"$cache/garbage.json"
+fuzz_assert "binary garbage" "$cache" "$lp"
+
+# 6. deeply nested: a session row carrying a field nested hundreds of levels
+# deep -- not one of the fields `clean` touches, but still part of the
+# object jq has to walk while building the merged row.
+cache=$root/cache-deep
+mkdir -p "$cache"
+jq -n '{host:"deep",fetched_at:1,ok:true,error:null,
+        payload:{host:"deep",generated_at:1,degraded:false,unreadable:0,
+                 sessions:[{"kind":"bg","pid":null,"name":"x","cwd":"/y","status":"idle",
+                            "working":false,"state":null,"needs":null,"idle_ms":1,
+                            "job_id":null,"finished":false,
+                            "extra":(reduce range(500) as $i (1; [.]))}]}}' \
+  >"$cache/deep.json"
+fuzz_assert "deeply nested" "$cache" "$lp"
+
+unset -f fuzz_assert
+rm -rf "$(dirname "$lp")" "$root"
+
+
 printf '\nclaude-sessions-all: two consumers polling concurrently\n'
 
 # In real use, the badge and the board are two SEPARATE processes, each on
