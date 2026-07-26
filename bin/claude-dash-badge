@@ -33,7 +33,13 @@ jq -c -r '
   | (.sessions | map(. + {host: (.host // $top_host)})) as $sess
   | (.degraded) as $degraded
   | (.unreadable) as $unreadable
-  | ($sess | map(select(.finished | not))) as $live
+  # A host marked unreachable keeps its last-known rows so they still show,
+  # but that data is stale, not live state -- it must not pin the badge on
+  # something already known to be out of date. Exclude only `unreachable`;
+  # a merely `stale` host (reachable, just polled a while ago) still counts.
+  | ($hostlist | map(select(.status == "unreachable") | .host)) as $unreachable_hosts
+  | ($sess | map(select(.finished | not))
+           | map(select(. as $row | ($unreachable_hosts | index($row.host)) == null))) as $live
   | ($live | map(select(.state == "blocked")) | length) as $blocked
   | ($live | map(select(.working and .state != "blocked")) | length) as $busy
   | ($live | map(select((.working | not) and .state != "blocked")) | length) as $idle

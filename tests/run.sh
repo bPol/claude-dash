@@ -1035,6 +1035,29 @@ check "an unreachable remote still shows its last-known row" \
   "$(jq -r '.tooltip | contains("last known on down-pc")' <<<"$out")" "true"
 rm -rf "$(dirname "$p")"
 
+# A machine that has been unreachable for hours keeps its last-known rows in
+# the cache -- including a blocked one -- but those rows are stale
+# information, not live state. They must not pin the badge amber on
+# something we already know is out of date: only a row from a host we can
+# still vouch for (fresh, or merely stale but not unreachable) may drive the
+# counts and the alert class. The unreachable host's blocked row must still
+# be visible in the tooltip, just not counted.
+p=$(multi_producer_stub \
+  '[{"host":"local-box","kind":"local","fetched_at":0,"age_ms":0,"status":"fresh","error":null},
+    {"host":"stale-pc","kind":"remote","fetched_at":0,"age_ms":180000,"status":"stale","error":null},
+    {"host":"down-pc","kind":"remote","fetched_at":0,"age_ms":600000,"status":"unreachable","error":"unreachable (dns)"}]' \
+  '[{"kind":"interactive","pid":1,"name":"local idle","cwd":"/x","status":"idle","working":false,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false,"host":"local-box"},
+    {"kind":"bg","pid":null,"name":"stale but blocked","cwd":"/y","status":"idle","working":false,"state":"blocked","needs":"still relevant?","idle_ms":180000,"job_id":"j-stale","finished":false,"host":"stale-pc"},
+    {"kind":"bg","pid":null,"name":"stale unreachable blocked row","cwd":"/z","status":"idle","working":false,"state":"blocked","needs":"long gone","idle_ms":600000,"job_id":"j-down","finished":false,"host":"down-pc"}]')
+out=$(CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash-badge")
+check "an unreachable host's stale blocked row is excluded from the badge count" \
+  "$(jq -r '.text' <<<"$out")" "0▸1▸1"
+check "a stale (but reachable) host's blocked row still counts and sets the alert class" \
+  "$(jq -r '.class' <<<"$out")" "alert"
+check "the unreachable host's stale row is still visible in the tooltip" \
+  "$(jq -r '.tooltip | contains("stale unreachable blocked row")' <<<"$out")" "true"
+rm -rf "$(dirname "$p")"
+
 printf '\nclaude-dash board\n'
 
 p=$(producer_stub '[
