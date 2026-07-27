@@ -186,6 +186,88 @@ check "status shell is still reported literally" \
   "$(jq -r '.sessions[0].status' <<<"$out")" "shell"
 rm -rf "$root"
 
+root=$(new_root)
+mk_session "$root" "$$" interactive "on a job's tempo" active 1000
+out=$(CLAUDE_DASH_ROOT=$root "$BIN/claude-sessions")
+check "status active counts as working" \
+  "$(jq -r '.sessions[0].working' <<<"$out")" "true"
+check "status active is not attention" \
+  "$(jq -r '.sessions[0].attention' <<<"$out")" "false"
+rm -rf "$root"
+
+# `waiting` is a real status Claude Code has started emitting for an
+# interactive session sitting untouched on another machine -- it is neither
+# busy/shell/active (working) nor idle, so it must fall into the ATTENTION
+# bucket instead of silently sorting into idle the way every unrecognised
+# status did before this change.
+root=$(new_root)
+mk_session "$root" "$$" interactive "stuck on another laptop" waiting 172800000
+out=$(CLAUDE_DASH_ROOT=$root "$BIN/claude-sessions")
+check "status waiting does not count as working" \
+  "$(jq -r '.sessions[0].working' <<<"$out")" "false"
+check "status waiting counts as attention" \
+  "$(jq -r '.sessions[0].attention' <<<"$out")" "true"
+check "status waiting is still reported literally" \
+  "$(jq -r '.sessions[0].status' <<<"$out")" "waiting"
+rm -rf "$root"
+
+# A status this tool has never seen before -- exactly what a future Claude
+# Code release could invent -- must default to ATTENTION, never to idle.
+root=$(new_root)
+mk_session "$root" "$$" interactive "future status" frobnicating 1000
+out=$(CLAUDE_DASH_ROOT=$root "$BIN/claude-sessions")
+check "a completely invented status counts as attention" \
+  "$(jq -r '.sessions[0].attention' <<<"$out")" "true"
+check "a completely invented status does not count as working" \
+  "$(jq -r '.sessions[0].working' <<<"$out")" "false"
+check "a completely invented status is still reported literally" \
+  "$(jq -r '.sessions[0].status' <<<"$out")" "frobnicating"
+rm -rf "$root"
+
+# A plain idle status must classify exactly as before: not working, not
+# attention.
+root=$(new_root)
+mk_session "$root" "$$" interactive "nothing pending" idle 1000
+out=$(CLAUDE_DASH_ROOT=$root "$BIN/claude-sessions")
+check "status idle is not attention (unchanged)" \
+  "$(jq -r '.sessions[0].attention' <<<"$out")" "false"
+check "status idle is not working (unchanged)" \
+  "$(jq -r '.sessions[0].working' <<<"$out")" "false"
+rm -rf "$root"
+
+# `state == "blocked"` must force attention regardless of the session's own
+# status -- even one that would otherwise read as working.
+root=$(new_root)
+mk_session "$root" "$$" bg "working but blocked" busy 1000 j-wb
+mk_job "$root" j-wb blocked "answer me"
+out=$(CLAUDE_DASH_ROOT=$root "$BIN/claude-sessions")
+check "a blocked state is attention regardless of a working status" \
+  "$(jq -r '.sessions[0].attention' <<<"$out")" "true"
+check "a blocked-but-busy row is still reported as working too" \
+  "$(jq -r '.sessions[0].working' <<<"$out")" "true"
+rm -rf "$root"
+
+# Ordering: attention rows sort before working rows, which sort before idle
+# rows -- regardless of how long each has been idle. Without this, an
+# attention row that has sat untouched the longest (the exact `waiting`
+# scenario above) would otherwise look "most stale" and sort last.
+root=$(new_root)
+sleep 60 & work_pid=$!
+sleep 60 & idle_pid=$!
+mk_session "$root" "$$" interactive "attn old" waiting 500000
+mk_session "$root" "$work_pid" interactive "work new" busy 1000
+mk_session "$root" "$idle_pid" interactive "idle mid" idle 50000
+out=$(CLAUDE_DASH_ROOT=$root "$BIN/claude-sessions")
+check "ordering: attention sorts first even when it is the most idle row" \
+  "$(jq -r '.sessions[0].name' <<<"$out")" "attn old"
+check "ordering: working sorts second" \
+  "$(jq -r '.sessions[1].name' <<<"$out")" "work new"
+check "ordering: idle sorts last" \
+  "$(jq -r '.sessions[2].name' <<<"$out")" "idle mid"
+kill "$work_pid" "$idle_pid" 2>/dev/null
+wait "$work_pid" "$idle_pid" 2>/dev/null
+rm -rf "$root"
+
 printf '\nclaude-sessions: orphan job rows (background process already exited)\n'
 
 # Shape (b): the process has exited, so there is no sessions/<pid>.json at
@@ -215,6 +297,35 @@ check "orphan blocked row is not working" \
   "$(jq -r '.sessions[0].working' <<<"$out")" "false"
 check "orphan blocked job_id is the job directory name" \
   "$(jq -r '.sessions[0].job_id' <<<"$out")" "j-orphan-blocked"
+check "orphan blocked row is attention" \
+  "$(jq -r '.sessions[0].attention' <<<"$out")" "true"
+rm -rf "$root"
+
+# `active` is a real value Claude Code has started writing as a job's
+# tempo -- job_row must classify it as working, same as a session status of
+# `active` does.
+root=$(new_root)
+mk_orphan_job "$root" j-orphan-active active "background task" "/home/u/x"
+out=$(CLAUDE_DASH_ROOT=$root "$BIN/claude-sessions")
+check "orphan job tempo active counts as working" \
+  "$(jq -r '.sessions[0].working' <<<"$out")" "true"
+check "orphan job tempo active is not attention" \
+  "$(jq -r '.sessions[0].attention' <<<"$out")" "false"
+check "orphan job tempo active is reported literally" \
+  "$(jq -r '.sessions[0].status' <<<"$out")" "active"
+rm -rf "$root"
+
+# An orphan job tempo this tool has never seen before must default to
+# attention, exactly like the session-status path -- not to working, which is
+# what the old job_row formula (permissive-by-default on any non-null,
+# non-blocked/done/error state) used to do.
+root=$(new_root)
+mk_orphan_job "$root" j-orphan-frob frobnicating "background task" "/home/u/x"
+out=$(CLAUDE_DASH_ROOT=$root "$BIN/claude-sessions")
+check "orphan job tempo frobnicating counts as attention" \
+  "$(jq -r '.sessions[0].attention' <<<"$out")" "true"
+check "orphan job tempo frobnicating is not working" \
+  "$(jq -r '.sessions[0].working' <<<"$out")" "false"
 rm -rf "$root"
 
 # job_row's name and needs are job-authored free text same as a session's,
@@ -264,6 +375,8 @@ check "a job with no usable state is not working" \
   "$(jq -r '.sessions[0].working' <<<"$out")" "false"
 check "a job with no usable state has null state" \
   "$(jq -r '.sessions[0].state' <<<"$out")" "null"
+check "a job with no usable state falls back to idle, not attention" \
+  "$(jq -r '.sessions[0].attention' <<<"$out")" "false"
 rm -rf "$root"
 
 root=$(new_root)
@@ -1176,6 +1289,68 @@ check "classify_error's stderr-derived text cannot inject a newline" \
   "$(jq -r '[.hosts[] | select(.host=="bad-error-host")][0].error | contains("\n")' <<<"$out")" "false"
 rm -rf "$(dirname "$lp")" "$root"
 
+# --- attention/working: re-derived, never trusted from a self-report -------
+# A remote's own claude-sessions build might be an older/divergent version
+# that does not know about a status like "waiting", or could simply report a
+# wrong value. claude-sessions-all must not carry a remote's self-reported
+# working/attention through unchecked -- it re-derives both from the
+# primitive status/state fields alone, so a stale or lying remote can never
+# hide a status that needs attention (or manufacture one that doesn't).
+root=$(new_root)
+cache=$root/cache
+mkdir -p "$cache"
+lp=$(producer_stub '[]')
+jq -n '{host:"stale-build",fetched_at:1,ok:true,error:null,
+        payload:{host:"stale-build",generated_at:1,degraded:false,unreadable:0,
+                 sessions:[{"kind":"interactive","pid":1,"name":"claims idle","cwd":"/y",
+                            "status":"waiting","working":true,"attention":false,
+                            "state":null,"needs":null,"idle_ms":1,"job_id":null,"finished":false}]}}' \
+  >"$cache/stale-build.json"
+out=$(CLAUDE_DASH_LOCAL_PRODUCER=$lp CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_HOSTS=$root/no-hosts \
+      "$BIN/claude-sessions-all")
+check "a remote self-reporting attention:false for waiting is overridden to true" \
+  "$(jq -r '[.sessions[] | select(.name=="claims idle")][0].attention' <<<"$out")" "true"
+check "a remote self-reporting working:true for waiting is corrected to false (full recompute, not a one-way OR)" \
+  "$(jq -r '[.sessions[] | select(.name=="claims idle")][0].working' <<<"$out")" "false"
+rm -rf "$(dirname "$lp")" "$root"
+
+# Same trust boundary, the other direction: a remote wrongly claiming
+# attention:true for an ordinary busy status must not be believed either --
+# re-derivation is a full recompute, not a one-way OR that can only add
+# attention, never remove a false claim of it.
+root=$(new_root)
+cache=$root/cache
+mkdir -p "$cache"
+lp=$(producer_stub '[]')
+jq -n '{host:"over-claims","fetched_at":1,"ok":true,"error":null,
+        "payload":{host:"over-claims",generated_at:1,degraded:false,unreadable:0,
+                   sessions:[{"kind":"interactive","pid":1,"name":"falsely flagged","cwd":"/y",
+                              "status":"busy","working":true,"attention":true,
+                              "state":null,"needs":null,"idle_ms":1,"job_id":null,"finished":false}]}}' \
+  >"$cache/over-claims.json"
+out=$(CLAUDE_DASH_LOCAL_PRODUCER=$lp CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_HOSTS=$root/no-hosts \
+      "$BIN/claude-sessions-all")
+check "a remote over-claiming attention:true for a plain busy status is corrected to false" \
+  "$(jq -r '[.sessions[] | select(.name=="falsely flagged")][0].attention' <<<"$out")" "false"
+rm -rf "$(dirname "$lp")" "$root"
+
+# The re-derivation applies uniformly to LOCAL rows too, not only remote ones
+# -- the local producer here is a stub standing in for a divergent/older
+# claude-sessions build, exactly like the remote case above, and must be
+# corrected the same way rather than trusted just because it is local.
+root=$(new_root)
+cache=$root/cache
+lp=$(producer_stub '[{"kind":"interactive","pid":1,"name":"local stale build","cwd":"/x",
+                       "status":"active","working":false,"attention":true,
+                       "state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
+out=$(CLAUDE_DASH_LOCAL_PRODUCER=$lp CLAUDE_DASH_CACHE=$cache CLAUDE_DASH_HOSTS=$root/no-hosts \
+      "$BIN/claude-sessions-all")
+check "a local row's stale working/attention is re-derived from status, not trusted" \
+  "$(jq -r '.sessions[0].working' <<<"$out")" "true"
+check "a local row's stale attention is re-derived from status, not trusted" \
+  "$(jq -r '.sessions[0].attention' <<<"$out")" "false"
+rm -rf "$(dirname "$lp")" "$root"
+
 printf '\nclaude-sessions-all: second review findings\n'
 
 # --- finding 1 (CRITICAL): type confusion, not just shape confusion --------
@@ -1503,12 +1678,12 @@ rm -rf "$(dirname "$lp")" "$root"
 printf '\nclaude-dash-badge\n'
 
 p=$(producer_stub '[
-  {"kind":"interactive","pid":1,"name":"api refactor","cwd":"/home/u/x","status":"busy","working":true,"state":null,"needs":null,"idle_ms":120000,"job_id":null,"finished":false},
-  {"kind":"interactive","pid":2,"name":"animation","cwd":"/home/u/x","status":"idle","working":false,"state":null,"needs":null,"idle_ms":600000,"job_id":null,"finished":false},
-  {"kind":"bg","pid":3,"name":"typo clarification","cwd":"/home/u/x","status":"idle","working":false,"state":"blocked","needs":"exit or edit?","idle_ms":360000,"job_id":"j","finished":false},
-  {"kind":"bg","pid":4,"name":"sales","cwd":"/home/u/x","status":"idle","working":false,"state":"done","needs":null,"idle_ms":950400000,"job_id":"k","finished":true}]')
+  {"kind":"interactive","pid":1,"name":"api refactor","cwd":"/home/u/x","status":"busy","working":true,"attention":false,"state":null,"needs":null,"idle_ms":120000,"job_id":null,"finished":false},
+  {"kind":"interactive","pid":2,"name":"animation","cwd":"/home/u/x","status":"idle","working":false,"attention":false,"state":null,"needs":null,"idle_ms":600000,"job_id":null,"finished":false},
+  {"kind":"bg","pid":3,"name":"typo clarification","cwd":"/home/u/x","status":"idle","working":false,"attention":true,"state":"blocked","needs":"exit or edit?","idle_ms":360000,"job_id":"j","finished":false},
+  {"kind":"bg","pid":4,"name":"sales","cwd":"/home/u/x","status":"idle","working":false,"attention":false,"state":"done","needs":null,"idle_ms":950400000,"job_id":"k","finished":true}]')
 out=$(CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash-badge")
-check "badge counts are busy/blocked/idle over unfinished rows" \
+check "badge counts are working/attention/idle over unfinished rows" \
   "$(jq -r '.text' <<<"$out")" "1▸1▸1"
 check "blocked sets the alert class" "$(jq -r '.class' <<<"$out")" "alert"
 check "tooltip leads with the hostname" \
@@ -1517,17 +1692,17 @@ check "tooltip mentions the blocked agent" \
   "$(jq -r '.tooltip | contains("typo clarification")' <<<"$out")" "true"
 rm -rf "$(dirname "$p")"
 
-p=$(producer_stub '[{"kind":"interactive","pid":1,"name":"n","cwd":"/x","status":"busy","working":true,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
+p=$(producer_stub '[{"kind":"interactive","pid":1,"name":"n","cwd":"/x","status":"busy","working":true,"attention":false,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
 check "busy without blocked is the active class" \
   "$(CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash-badge" | jq -r '.class')" "active"
 rm -rf "$(dirname "$p")"
 
-p=$(producer_stub '[{"kind":"interactive","pid":1,"name":"n","cwd":"/x","status":"shell","working":true,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
+p=$(producer_stub '[{"kind":"interactive","pid":1,"name":"n","cwd":"/x","status":"shell","working":true,"attention":false,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
 check "a session in a shell command counts as busy, not idle" \
   "$(CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash-badge" | jq -r '.text')" "1▸0▸0"
 rm -rf "$(dirname "$p")"
 
-p=$(producer_stub '[{"kind":"interactive","pid":1,"name":"n","cwd":"/x","status":"idle","working":false,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
+p=$(producer_stub '[{"kind":"interactive","pid":1,"name":"n","cwd":"/x","status":"idle","working":false,"attention":false,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
 check "all idle is the quiet class" \
   "$(CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash-badge" | jq -r '.class')" "quiet"
 rm -rf "$(dirname "$p")"
@@ -1561,7 +1736,7 @@ d=$(mktemp -d "${TMPDIR:-/tmp}/claude-dash-prod.XXXXXX")
 { printf '#!/usr/bin/env bash\ncat <<'"'"'JSON'"'"'\n'
   jq -n '{host:"testbox",generated_at:0,degraded:false,unreadable:1,
           sessions:[{"kind":"interactive","pid":1,"name":"n","cwd":"/x","status":"busy",
-                     "working":true,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]}'
+                     "working":true,"attention":false,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]}'
   printf 'JSON\n'; } >"$d/producer"
 chmod +x "$d/producer"
 out=$(CLAUDE_DASH_PRODUCER=$d/producer "$BIN/claude-dash-badge")
@@ -1575,12 +1750,38 @@ rm -rf "$d"
 # exist) must be counted once, as blocked -- not once in each bucket, which
 # would break busy+blocked+idle == unfinished sessions.
 p=$(producer_stub '[
-  {"kind":"bg","pid":1,"name":"working and blocked","cwd":"/x","status":"busy","working":true,"state":"blocked","needs":"n","idle_ms":1000,"job_id":"j1","finished":false},
-  {"kind":"interactive","pid":2,"name":"plain busy","cwd":"/x","status":"busy","working":true,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false},
-  {"kind":"interactive","pid":3,"name":"plain idle","cwd":"/x","status":"idle","working":false,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
+  {"kind":"bg","pid":1,"name":"working and blocked","cwd":"/x","status":"busy","working":true,"attention":true,"state":"blocked","needs":"n","idle_ms":1000,"job_id":"j1","finished":false},
+  {"kind":"interactive","pid":2,"name":"plain busy","cwd":"/x","status":"busy","working":true,"attention":false,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false},
+  {"kind":"interactive","pid":3,"name":"plain idle","cwd":"/x","status":"idle","working":false,"attention":false,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
 out=$(CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash-badge")
-check "a row that is both working and blocked counts once, as blocked" \
+check "a row that is both working and blocked counts once, as attention" \
   "$(jq -r '.text' <<<"$out")" "1▸1▸1"
+rm -rf "$(dirname "$p")"
+
+# `waiting` and any status this tool has never seen before must count as
+# attention, not silently vanish into idle -- this is the exact bug the
+# three-way classification exists to close.
+p=$(producer_stub '[{"kind":"interactive","pid":1,"name":"stuck on another laptop","cwd":"/x","status":"waiting","working":false,"attention":true,"state":null,"needs":null,"idle_ms":172800000,"job_id":null,"finished":false}]')
+out=$(CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash-badge")
+check "waiting counts as attention, not idle" \
+  "$(jq -r '.text' <<<"$out")" "0▸1▸0"
+check "waiting sets the alert class" "$(jq -r '.class' <<<"$out")" "alert"
+rm -rf "$(dirname "$p")"
+
+p=$(producer_stub '[{"kind":"interactive","pid":1,"name":"on a jobs tempo","cwd":"/x","status":"active","working":true,"attention":false,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
+out=$(CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash-badge")
+check "active counts as working, not attention" \
+  "$(jq -r '.text' <<<"$out")" "1▸0▸0"
+check "active alone is the active class, not alert" \
+  "$(jq -r '.class' <<<"$out")" "active"
+rm -rf "$(dirname "$p")"
+
+p=$(producer_stub '[{"kind":"interactive","pid":1,"name":"future status","cwd":"/x","status":"frobnicating","working":false,"attention":true,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
+out=$(CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash-badge")
+check "a completely invented status counts as attention" \
+  "$(jq -r '.text' <<<"$out")" "0▸1▸0"
+check "a completely invented status sets the alert class" \
+  "$(jq -r '.class' <<<"$out")" "alert"
 rm -rf "$(dirname "$p")"
 
 printf '\nclaude-dash-badge: multi-host (claude-sessions-all shaped output)\n'
@@ -1602,8 +1803,8 @@ multi_producer_stub() {   # multi_producer_stub HOSTS_JSON SESSIONS_JSON -> path
 p=$(multi_producer_stub \
   '[{"host":"local-box","kind":"local","fetched_at":0,"age_ms":0,"status":"fresh","error":null},
     {"host":"worker-pc","kind":"remote","fetched_at":0,"age_ms":1000,"status":"fresh","error":null}]' \
-  '[{"kind":"interactive","pid":1,"name":"local idle","cwd":"/x","status":"idle","working":false,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false,"host":"local-box"},
-    {"kind":"bg","pid":null,"name":"remote blocked agent","cwd":"/y","status":"idle","working":false,"state":"blocked","needs":"answer me","idle_ms":2000,"job_id":"j1","finished":false,"host":"worker-pc"}]')
+  '[{"kind":"interactive","pid":1,"name":"local idle","cwd":"/x","status":"idle","working":false,"attention":false,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false,"host":"local-box"},
+    {"kind":"bg","pid":null,"name":"remote blocked agent","cwd":"/y","status":"idle","working":false,"attention":true,"state":"blocked","needs":"answer me","idle_ms":2000,"job_id":"j1","finished":false,"host":"worker-pc"}]')
 out=$(CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash-badge")
 check "a remote blocked agent sets the alert (amber) class" \
   "$(jq -r '.class' <<<"$out")" "alert"
@@ -1621,7 +1822,7 @@ p=$(multi_producer_stub \
   '[{"host":"local-box","kind":"local","fetched_at":0,"age_ms":0,"status":"fresh","error":null},
     {"host":"stale-pc","kind":"remote","fetched_at":0,"age_ms":180000,"status":"stale","error":null},
     {"host":"down-pc","kind":"remote","fetched_at":0,"age_ms":600000,"status":"unreachable","error":"unreachable (dns)"}]' \
-  '[{"kind":"interactive","pid":1,"name":"last known on down-pc","cwd":"/y","status":"idle","working":false,"state":null,"needs":null,"idle_ms":600000,"job_id":null,"finished":false,"host":"down-pc"}]')
+  '[{"kind":"interactive","pid":1,"name":"last known on down-pc","cwd":"/y","status":"idle","working":false,"attention":false,"state":null,"needs":null,"idle_ms":600000,"job_id":null,"finished":false,"host":"down-pc"}]')
 out=$(CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash-badge")
 check "a stale remote's heading shows a relative age" \
   "$(jq -r '.tooltip | contains("stale-pc") and contains("3m ago")' <<<"$out")" "true"
@@ -1658,9 +1859,9 @@ p=$(multi_producer_stub \
   '[{"host":"local-box","kind":"local","fetched_at":0,"age_ms":0,"status":"fresh","error":null},
     {"host":"stale-pc","kind":"remote","fetched_at":0,"age_ms":180000,"status":"stale","error":null},
     {"host":"down-pc","kind":"remote","fetched_at":0,"age_ms":600000,"status":"unreachable","error":"unreachable (dns)"}]' \
-  '[{"kind":"interactive","pid":1,"name":"local idle","cwd":"/x","status":"idle","working":false,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false,"host":"local-box"},
-    {"kind":"bg","pid":null,"name":"stale but blocked","cwd":"/y","status":"idle","working":false,"state":"blocked","needs":"still relevant?","idle_ms":180000,"job_id":"j-stale","finished":false,"host":"stale-pc"},
-    {"kind":"bg","pid":null,"name":"stale unreachable blocked row","cwd":"/z","status":"idle","working":false,"state":"blocked","needs":"long gone","idle_ms":600000,"job_id":"j-down","finished":false,"host":"down-pc"}]')
+  '[{"kind":"interactive","pid":1,"name":"local idle","cwd":"/x","status":"idle","working":false,"attention":false,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false,"host":"local-box"},
+    {"kind":"bg","pid":null,"name":"stale but blocked","cwd":"/y","status":"idle","working":false,"attention":true,"state":"blocked","needs":"still relevant?","idle_ms":180000,"job_id":"j-stale","finished":false,"host":"stale-pc"},
+    {"kind":"bg","pid":null,"name":"stale unreachable blocked row","cwd":"/z","status":"idle","working":false,"attention":true,"state":"blocked","needs":"long gone","idle_ms":600000,"job_id":"j-down","finished":false,"host":"down-pc"}]')
 out=$(CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash-badge")
 check "an unreachable host's stale blocked row is excluded from the badge count" \
   "$(jq -r '.text' <<<"$out")" "0▸1▸1"
@@ -1670,12 +1871,30 @@ check "the unreachable host's stale row is still visible in the tooltip" \
   "$(jq -r '.tooltip | contains("stale unreachable blocked row")' <<<"$out")" "true"
 rm -rf "$(dirname "$p")"
 
+# Same exclusion rule, but the attention row here comes from an unrecognised
+# status (`waiting`), not a `blocked` state -- proving the unreachable-host
+# exclusion keys off the `attention` field itself, not off `state ==
+# "blocked"` specifically.
+p=$(multi_producer_stub \
+  '[{"host":"local-box","kind":"local","fetched_at":0,"age_ms":0,"status":"fresh","error":null},
+    {"host":"down-pc","kind":"remote","fetched_at":0,"age_ms":600000,"status":"unreachable","error":"unreachable (dns)"}]' \
+  '[{"kind":"interactive","pid":1,"name":"local idle","cwd":"/x","status":"idle","working":false,"attention":false,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false,"host":"local-box"},
+    {"kind":"interactive","pid":null,"name":"stale unreachable waiting row","cwd":"/z","status":"waiting","working":false,"attention":true,"state":null,"needs":null,"idle_ms":600000,"job_id":null,"finished":false,"host":"down-pc"}]')
+out=$(CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash-badge")
+check "an unreachable host's stale attention (non-blocked) row is excluded from the count" \
+  "$(jq -r '.text' <<<"$out")" "0▸0▸1"
+check "an unreachable host's stale attention row does not set the alert class" \
+  "$(jq -r '.class' <<<"$out")" "quiet"
+check "the unreachable host's stale attention row is still visible in the tooltip" \
+  "$(jq -r '.tooltip | contains("stale unreachable waiting row")' <<<"$out")" "true"
+rm -rf "$(dirname "$p")"
+
 printf '\nclaude-dash board\n'
 
 p=$(producer_stub '[
-  {"kind":"interactive","pid":1,"name":"api refactor","cwd":"/home/u/src/api","status":"busy","working":true,"state":null,"needs":null,"idle_ms":120000,"job_id":null,"finished":false},
-  {"kind":"bg","pid":3,"name":"typo clarification","cwd":"/home/u/src/api","status":"idle","working":false,"state":"blocked","needs":"did you mean exit or edit?","idle_ms":360000,"job_id":"j","finished":false},
-  {"kind":"bg","pid":4,"name":"sales","cwd":"/home/u/src/ops","status":"idle","working":false,"state":"done","needs":null,"idle_ms":950400000,"job_id":"k","finished":true}]')
+  {"kind":"interactive","pid":1,"name":"api refactor","cwd":"/home/u/src/api","status":"busy","working":true,"attention":false,"state":null,"needs":null,"idle_ms":120000,"job_id":null,"finished":false},
+  {"kind":"bg","pid":3,"name":"typo clarification","cwd":"/home/u/src/api","status":"idle","working":false,"attention":true,"state":"blocked","needs":"did you mean exit or edit?","idle_ms":360000,"job_id":"j","finished":false},
+  {"kind":"bg","pid":4,"name":"sales","cwd":"/home/u/src/ops","status":"idle","working":false,"attention":false,"state":"done","needs":null,"idle_ms":950400000,"job_id":"k","finished":true}]')
 frame=$(COLUMNS=100 CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash" --once)
 
 check "header carries the hostname" \
@@ -1697,8 +1916,8 @@ rm -rf "$(dirname "$p")"
 # must hold at every width, narrow ones included, where the mid-column
 # arithmetic ($w - 46) can go negative.
 p=$(producer_stub '[
-  {"kind":"interactive","pid":1,"name":"a very long session name that will definitely need truncating","cwd":"/home/u/x","status":"busy","working":true,"state":null,"needs":null,"idle_ms":120000,"job_id":null,"finished":false},
-  {"kind":"bg","pid":3,"name":"typo clarification","cwd":"/home/u/x","status":"idle","working":false,"state":"blocked","needs":"did you mean exit or edit, or something else entirely that runs well past any column width","idle_ms":360000,"job_id":"j","finished":false}]')
+  {"kind":"interactive","pid":1,"name":"a very long session name that will definitely need truncating","cwd":"/home/u/x","status":"busy","working":true,"attention":false,"state":null,"needs":null,"idle_ms":120000,"job_id":null,"finished":false},
+  {"kind":"bg","pid":3,"name":"typo clarification","cwd":"/home/u/x","status":"idle","working":false,"attention":true,"state":"blocked","needs":"did you mean exit or edit, or something else entirely that runs well past any column width","idle_ms":360000,"job_id":"j","finished":false}]')
 for w in 40 60 100 200; do
   frame=$(COLUMNS=$w CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash" --once)
   check "no frame line exceeds $w columns" \
@@ -1726,15 +1945,39 @@ check "unreadable files are announced" "$(grep -c '2 unreadable' <<<"$frame")" "
 rm -rf "$d"
 
 # Same mutual-exclusion requirement as the badge: a row both working and
-# blocked must count once (as blocked), so busy+blocked+idle == live rows.
+# blocked must count once (as attention), so working+attention+idle == live
+# rows.
 p=$(producer_stub '[
-  {"kind":"bg","pid":1,"name":"working and blocked","cwd":"/x","status":"busy","working":true,"state":"blocked","needs":"n","idle_ms":1000,"job_id":"j1","finished":false},
-  {"kind":"interactive","pid":2,"name":"plain busy","cwd":"/x","status":"busy","working":true,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false},
-  {"kind":"interactive","pid":3,"name":"plain idle","cwd":"/x","status":"idle","working":false,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
+  {"kind":"bg","pid":1,"name":"working and blocked","cwd":"/x","status":"busy","working":true,"attention":true,"state":"blocked","needs":"n","idle_ms":1000,"job_id":"j1","finished":false},
+  {"kind":"interactive","pid":2,"name":"plain busy","cwd":"/x","status":"busy","working":true,"attention":false,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false},
+  {"kind":"interactive","pid":3,"name":"plain idle","cwd":"/x","status":"idle","working":false,"attention":false,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
 frame=$(COLUMNS=100 CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash" --once)
-check "board's busy/blocked/idle counts sum to the live session count" \
-  "$(grep -oE '[0-9]+ busy · [0-9]+ blocked · [0-9]+ idle' <<<"$frame" \
+check "board's working/attention/idle counts sum to the live session count" \
+  "$(grep -oE '[0-9]+ working · [0-9]+ attention · [0-9]+ idle' <<<"$frame" \
      | grep -oE '[0-9]+' | awk '{s+=$1} END{print s+0}')" "3"
+rm -rf "$(dirname "$p")"
+
+# `waiting` must render with the same "!" glyph a blocked row uses, and the
+# literal status word must still show -- never flattened to a generic label.
+# `active` renders with the working "●" glyph, and a completely invented
+# status ("quux") gets the "!" glyph too. "quux" (not "frobnicating") is used
+# here specifically because it fits the 8-column status field without
+# ellipsis-truncation, which would otherwise obscure the exact literal text
+# this test greps for -- truncation of a long status word is expected board
+# behaviour (same as a long name), not something this test is about.
+p=$(producer_stub '[
+  {"kind":"interactive","pid":1,"name":"stuck on another laptop","cwd":"/x","status":"waiting","working":false,"attention":true,"state":null,"needs":null,"idle_ms":172800000,"job_id":null,"finished":false},
+  {"kind":"interactive","pid":2,"name":"on a jobs tempo","cwd":"/x","status":"active","working":true,"attention":false,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false},
+  {"kind":"interactive","pid":3,"name":"future status","cwd":"/x","status":"quux","working":false,"attention":true,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
+frame=$(COLUMNS=100 CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash" --once)
+check "an unrecognised status (waiting) renders with the blocked-style ! glyph" \
+  "$(grep -c '! waiting' <<<"$frame")" "1"
+check "active renders with the working glyph, not the attention glyph" \
+  "$(grep -c '● active' <<<"$frame")" "1"
+check "a completely invented status renders with the attention glyph" \
+  "$(grep -c '! quux' <<<"$frame")" "1"
+check "header counts reflect the mixed fixture: 1 working, 2 attention, 0 idle" \
+  "$(grep -c '1 working · 2 attention · 0 idle' <<<"$frame")" "1"
 rm -rf "$(dirname "$p")"
 
 # Without a terminal on stdin, `read -t` returns instantly. If the loop used it
@@ -1755,10 +1998,10 @@ p=$(multi_producer_stub \
     {"host":"worker-pc","kind":"remote","fetched_at":0,"age_ms":1000,"status":"fresh","error":null},
     {"host":"stale-pc","kind":"remote","fetched_at":0,"age_ms":180000,"status":"stale","error":null},
     {"host":"down-pc","kind":"remote","fetched_at":0,"age_ms":600000,"status":"unreachable","error":"unreachable (dns)"}]' \
-  '[{"kind":"interactive","pid":1,"name":"local task","cwd":"/x","status":"busy","working":true,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false,"host":"local-box"},
-    {"kind":"bg","pid":null,"name":"remote blocked agent","cwd":"/y","status":"idle","working":false,"state":"blocked","needs":"answer me","idle_ms":2000,"job_id":"j1","finished":false,"host":"worker-pc"},
-    {"kind":"interactive","pid":null,"name":"stale remote row","cwd":"/z","status":"idle","working":false,"state":null,"needs":null,"idle_ms":180000,"job_id":null,"finished":false,"host":"stale-pc"},
-    {"kind":"interactive","pid":null,"name":"last known on down-pc","cwd":"/w","status":"idle","working":false,"state":null,"needs":null,"idle_ms":600000,"job_id":null,"finished":false,"host":"down-pc"}]')
+  '[{"kind":"interactive","pid":1,"name":"local task","cwd":"/x","status":"busy","working":true,"attention":false,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false,"host":"local-box"},
+    {"kind":"bg","pid":null,"name":"remote blocked agent","cwd":"/y","status":"idle","working":false,"attention":true,"state":"blocked","needs":"answer me","idle_ms":2000,"job_id":"j1","finished":false,"host":"worker-pc"},
+    {"kind":"interactive","pid":null,"name":"stale remote row","cwd":"/z","status":"idle","working":false,"attention":false,"state":null,"needs":null,"idle_ms":180000,"job_id":null,"finished":false,"host":"stale-pc"},
+    {"kind":"interactive","pid":null,"name":"last known on down-pc","cwd":"/w","status":"idle","working":false,"attention":false,"state":null,"needs":null,"idle_ms":600000,"job_id":null,"finished":false,"host":"down-pc"}]')
 frame=$(COLUMNS=100 CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash" --once)
 check "top header still names the local host" \
   "$(grep -c 'claude sessions · local-box' <<<"$frame")" "1"
@@ -1777,7 +2020,7 @@ check "an unreachable remote host's heading says unreachable with its error" \
 check "an unreachable remote's last-known row still shows" \
   "$(grep -c 'last known on down-pc' <<<"$frame")" "1"
 check "counts sum across every host, not just local" \
-  "$(grep -oE '[0-9]+ busy · [0-9]+ blocked · [0-9]+ idle' <<<"$frame" \
+  "$(grep -oE '[0-9]+ working · [0-9]+ attention · [0-9]+ idle' <<<"$frame" \
      | grep -oE '[0-9]+' | awk '{s+=$1} END{print s+0}')" "4"
 check "multi-host frame still respects the terminal width" \
   "$(awk 'length > 100' <<<"$frame" | wc -l)" "0"
@@ -1801,7 +2044,7 @@ rm -rf "$(dirname "$p")"
 # local board: no remote block, just the local rows.
 p=$(multi_producer_stub \
   '[{"host":"local-box","kind":"local","fetched_at":0,"age_ms":0,"status":"fresh","error":null}]' \
-  '[{"kind":"interactive","pid":1,"name":"only local","cwd":"/x","status":"busy","working":true,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false,"host":"local-box"}]')
+  '[{"kind":"interactive","pid":1,"name":"only local","cwd":"/x","status":"busy","working":true,"attention":false,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false,"host":"local-box"}]')
 frame=$(COLUMNS=100 CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash" --once)
 check "a one-entry hosts array renders with no remote block at all" \
   "$(grep -cE '^ [a-z-]+-pc|^ local-box' <<<"$frame")" "0"

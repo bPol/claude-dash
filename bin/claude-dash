@@ -50,8 +50,13 @@ frame() {
         (if $n == 1 then "…" else .[0:($n - 1)] + "…" end)
       else . + (" " * ($n - length))
       end;
+    # attention (derived once, upstream, never recomputed here from
+    # .state/.status) covers `state == "blocked"` and takes the same "!"
+    # glyph blocked rows always used -- plus every unrecognised status, so a
+    # row like `waiting` renders as "! waiting" instead of silently sorting
+    # in with the idle "○" rows.
     def glyph:
-      if .state == "blocked" then "!"
+      if .attention then "!"
       elif .working then "●"
       else "○" end;
     # named status_label, not label: jq 1.7 reserves `label` as a keyword
@@ -71,9 +76,9 @@ frame() {
     | (.hosts // [{host:$top_host, kind:"local", fetched_at:.generated_at, age_ms:0, status:"fresh", error:null}]) as $hostlist
     | (.sessions | map(. + {host: (.host // $top_host)})) as $sess
     | ($sess | map(select(.finished | not))) as $live
-    | ($live | map(select(.state == "blocked")) | length) as $nblocked
-    | ($live | map(select(.working and .state != "blocked")) | length) as $nbusy
-    | ($live | map(select((.working | not) and .state != "blocked")) | length) as $nidle
+    | ($live | map(select(.attention)) | length) as $nattention
+    | ($live | map(select(.working and (.attention | not))) | length) as $nworking
+    | ($live | map(select((.working | not) and (.attention | not))) | length) as $nidle
     # One block per host: local first (no heading of its own -- the top
     # title already names it), then one block per remote host with its
     # status in the header. Each block keeps the INTERACTIVE/BACKGROUND
@@ -106,7 +111,7 @@ frame() {
     | [ " claude sessions · \($top_host)" +
         (if .degraded then "   ⚠ degraded (CLI fallback)" else "" end) +
         (if .unreadable > 0 then "   ⚠ \(.unreadable) unreadable" else "" end),
-        "   \($nbusy) busy · \($nblocked) blocked · \($nidle) idle",
+        "   \($nworking) working · \($nattention) attention · \($nidle) idle",
         "" ]
       + ($blocks | flatten)
       + (if ($live | length) == 0 then ["   no sessions running", ""] else [] end)

@@ -44,6 +44,50 @@ fails because `foot`, `swaymsg` or `waybar` are missing, it tells you to use
 | `claude-dash` | The board. `--once` prints one frame and exits. Grouped by host, local block first. |
 | `claude-dash-toggle` | waybar `on-click`: show or hide the scratchpad window. |
 
+## Session classification
+
+`claude-sessions` sorts every session/agent into exactly one of three groups,
+once, and stamps the result on the record as `working` (bool) and `attention`
+(bool) alongside the raw `status`/`state` fields. Nothing downstream --
+`claude-sessions-all`, `claude-dash-badge`, `claude-dash` -- recomputes this
+from `status`/`state` itself; they only ever read `working`/`attention`.
+
+| Group | Meaning | Membership |
+|---|---|---|
+| **WORKING** | The machine is doing something; you need not act. | `status` is `busy`, `shell`, or `active`. |
+| **IDLE** | Nothing pending. | `status` is `idle`. |
+| **ATTENTION** | You need to act. | `state` is `blocked`, **or** `status` is anything not listed above. |
+
+The ATTENTION rule is deliberately a catch-all, not a second exhaustive list:
+any status this tool does not explicitly recognise as WORKING or IDLE --
+`waiting`, a typo, a status a future Claude Code release invents tomorrow --
+falls into ATTENTION rather than silently sorting into idle. That silent
+sort-into-idle was a real bug this classification exists to close: an
+interactive session sitting on another machine with status `waiting` used to
+be indistinguishable from "nothing running" in every count and every alert,
+which is precisely the failure mode a monitoring tool must not have. A status
+that has never been seen before is far more likely to be something that
+wants attention than something safely idle, so that is the side it defaults
+to. `state == "blocked"` forces attention independently of `status`, since an
+agent can be blocked waiting on the user while its own status still says
+"busy" or "active".
+
+Both the board and the tooltip always show the literal `status`/`state`
+word, whichever group it falls into -- an unfamiliar value must be
+identifiable at a glance, never flattened to a generic label. A row in
+ATTENTION for any reason renders with the same "!" glyph a `blocked` row
+always used, so e.g. `waiting` shows as `! waiting`.
+
+`claude-sessions-all` re-derives `working`/`attention` itself from the raw
+`status`/`state` of every row -- local rows and each remote's rows alike --
+rather than trust the value a producer already attached. A remote host runs
+its own copy of `claude-sessions`, which can be an older or otherwise
+divergent build that does not know a given status is now `WORKING` or
+`ATTENTION`; trusting its self-report at face value would just move the same
+"unrecognised status is invisible" hole out to whichever machine has the
+oldest install. Local rows get the identical recompute, not a pass-through,
+so the rule applies uniformly regardless of where a row came from.
+
 ## Aggregating other machines
 
 List remote hosts, one per line, in `~/.config/claude-dash/hosts`
@@ -135,7 +179,7 @@ one-entry `hosts` array — a single-machine setup is unchanged.
 ## Tests
 
 ```sh
-./tests/run.sh          # 204 checks, no sway, network or Claude Code session required
+./tests/run.sh          # 349 checks, no sway, network or Claude Code session required
 shellcheck -x bin/* install.sh tests/*.sh
 ```
 

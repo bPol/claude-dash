@@ -49,9 +49,14 @@ jq -c -r '
   | ($hostlist | map(select(.status == "unreachable") | .host)) as $unreachable_hosts
   | ($sess | map(select(.finished | not))
            | map(select(. as $row | ($unreachable_hosts | index($row.host)) == null))) as $live
-  | ($live | map(select(.state == "blocked")) | length) as $blocked
-  | ($live | map(select(.working and .state != "blocked")) | length) as $busy
-  | ($live | map(select((.working | not) and .state != "blocked")) | length) as $idle
+  # Three-way classification: `.attention` was derived once, upstream (in
+  # claude-sessions, then re-derived/trust-checked again by
+  # claude-sessions-all for remote rows) -- it is never recomputed here from
+  # `.state`/`.status` directly. attention takes precedence over working: a
+  # row that is both (e.g. busy but blocked) counts once, as attention.
+  | ($live | map(select(.attention)) | length) as $attention
+  | ($live | map(select(.working and (.attention | not))) | length) as $working
+  | ($live | map(select((.working | not) and (.attention | not))) | length) as $idle
   | (($sess | length) == 0 and .unreadable > 0) as $blind
   | ($hostlist | map(
       . as $hd
@@ -74,10 +79,10 @@ jq -c -r '
         )
     )) as $groups
   | {
-      text: (if $blind then "?" else "\($busy)▸\($blocked)▸\($idle)" end),
+      text: (if $blind then "?" else "\($working)▸\($attention)▸\($idle)" end),
       class: (if $blind then "error"
-              elif $blocked > 0 then "alert"
-              elif $busy > 0 then "active"
+              elif $attention > 0 then "alert"
+              elif $working > 0 then "active"
               else "quiet" end),
       tooltip: ($groups | flatten | join("\n"))
     }' <<<"$data" 2>/dev/null || fail "claude-dash: could not parse producer output"
