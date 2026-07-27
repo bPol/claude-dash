@@ -13,7 +13,7 @@ has usually already exited its process, so it lives only as a job record — and
 sits there, unanswered, for days.
 
 claude-dash reads Claude Code's session registry directly and shows all of it in
-one place, with the things that want you from you pushed to the top.
+one place, with anything waiting on you pushed to the top.
 
 ## What it looks like
 
@@ -214,3 +214,7 @@ path to the real `claude` binary or your real cache.
   collapsed "N finished" footer, which are still hard-cut at very narrow widths.
 - The toggle closes fd 9 so the launch lock isn't held for the board's lifetime,
   but no test would catch it if that were removed.
+
+## Licence
+
+MIT — see [LICENSE](LICENSE).
