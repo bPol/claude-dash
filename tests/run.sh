@@ -2099,13 +2099,22 @@ STUB_BIN=$HERE/stub
 
 # tree_json STATE VISIBLE — a minimal get_tree reply. STATE "absent" yields a
 # tree with no matching window at all.
+# tree_json STATE VISIBLE [WIN_X] — a minimal get_tree reply. STATE "absent"
+# yields a tree with no matching window. WIN_X places the window's rect: default
+# 100 sits inside the fake output (0..1920), 9000 sits outside every output, so
+# the toggle's on_screen check can be exercised both ways.
 tree_json() {
+  local win_x=${3:-100}
   if [[ $1 == absent ]]; then
-    jq -n '{nodes:[{nodes:[],floating_nodes:[]}]}'
+    jq -n '{type:"root",nodes:[{type:"output",active:true,
+             rect:{x:0,y:0,width:1920,height:1080},nodes:[],floating_nodes:[]}]}'
   else
-    jq -n --arg s "$1" --argjson v "$2" \
-      '{nodes:[{nodes:[{app_id:"claude-dash",scratchpad_state:$s,visible:$v}],
-                floating_nodes:[]}]}'
+    jq -n --arg s "$1" --argjson v "$2" --argjson x "$win_x" \
+      '{type:"root",nodes:[{type:"output",active:true,
+          rect:{x:0,y:0,width:1920,height:1080},
+          nodes:[{app_id:"claude-dash",scratchpad_state:$s,visible:$v,
+                  rect:{x:$x,y:100,width:900,height:520}}],
+          floating_nodes:[]}]}'
   fi
 }
 
@@ -2116,7 +2125,7 @@ tree_json() {
 # the `kill` builtin cannot do.
 run_toggle() {
   local d fake_pid; d=$(mktemp -d "${TMPDIR:-/tmp}/claude-dash-toggle.XXXXXX")
-  tree_json "$1" "$2" >"$d/tree.json"
+  tree_json "$1" "$2" "${3:-100}" >"$d/tree.json"
   : >"$d/log"
   if [[ -z ${CLAUDE_DASH_NO_BOARD:-} ]]; then
     STUB_LOG=$d/log "$STUB_BIN/fakeboard" & fake_pid=$!
@@ -2144,12 +2153,20 @@ check "showing a visible window signals the board to resume" \
 # Geometry is applied by the toggle, not the sway for_window rule: that rule
 # fires the instant the window maps and foot then overrides it with its own
 # default size, so the board came up at 700x484 instead of the intended size.
-check "showing sizes the window explicitly" \
-  "$(printf '%s' "$log" | grep -c 'resize set 900px 520px')" "1"
-check "showing centres the window on the focused output" \
-  "$(printf '%s' "$log" | grep -c 'move position center')" "1"
-check "resize precedes centring" \
-  "$(printf '%s' "$log" | grep -n 'resize set\|move position center' | head -1 | grep -c resize)" "1"
+# A window already on an output keeps whatever position it was dragged to --
+# re-centring on every show would undo the drag on the next click.
+check "showing an on-screen window does not reposition it" \
+  "$(printf '%s' "$log" | grep -c 'move position center')" "0"
+check "showing an on-screen window does not resize it" \
+  "$(printf '%s' "$log" | grep -c 'resize set')" "0"
+
+# ...but a window left where no output covers it any more is unreachable, so
+# that is the one case worth overriding the user's chosen position.
+log_off=$(run_toggle fresh true 9000)
+check "a window off every output is rescued back on screen" \
+  "$(printf '%s' "$log_off" | grep -c 'move position center')" "1"
+check "the rescue also restores the intended size" \
+  "$(printf '%s' "$log_off" | grep -c 'resize set 900px 520px')" "1"
 
 log=$(run_toggle fresh false)
 check "hiding signals the board to idle" \

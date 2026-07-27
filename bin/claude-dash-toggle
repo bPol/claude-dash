@@ -71,6 +71,22 @@ place_window() {
   swaymsg "[app_id=\"$APP_ID\"] move position center" >/dev/null 2>&1
 }
 
+# on_screen — true when the board's rect overlaps some active output. A window
+# dragged to a monitor that is later unplugged, or left at coordinates no output
+# covers any more, is unreachable; that is the one case worth overriding the
+# user's chosen position for.
+on_screen() {
+  swaymsg -t get_tree 2>/dev/null | jq -e --arg a "$APP_ID" '
+    ([recurse(.nodes[]?, .floating_nodes[]?) | select(.app_id == $a)][0].rect) as $w
+    | if $w == null then false
+      else [ .. | objects | select(has("rect") and .type? == "output" and .active == true)
+             | .rect
+             | ($w.x < (.x + .width)) and ((($w.x + $w.width)) > .x)
+               and ($w.y < (.y + .height)) and ((($w.y + $w.height)) > .y) ]
+           | any
+      end' >/dev/null 2>&1
+}
+
 command -v swaymsg >/dev/null 2>&1 || { notify "swaymsg not found — not running under sway"; exit 1; }
 command -v jq      >/dev/null 2>&1 || { notify "jq is not installed"; exit 1; }
 
@@ -86,7 +102,14 @@ if [[ $state != absent ]]; then
   # `scratchpad show` on an already-visible scratchpad window hides it, so this
   # single command is the whole toggle.
   swaymsg "[app_id=\"$APP_ID\"] scratchpad show" >/dev/null 2>&1
-  if visible; then place_window; signal_board USR2; else signal_board USR1; fi
+  # Deliberately NOT re-placing here: the window keeps wherever you dragged it
+  # to. Only rescue it if it is no longer over any active output.
+  if visible; then
+    on_screen || place_window
+    signal_board USR2
+  else
+    signal_board USR1
+  fi
   exit 0
 fi
 
