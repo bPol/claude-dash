@@ -65,6 +65,13 @@ git clone <this repo> ~/projects/claude-dash
 cd ~/projects/claude-dash && ./install.sh
 ```
 
+The board is a floating scratchpad window: **Super+left-drag** moves it,
+**Super+right-drag** resizes it, and it keeps wherever you put it across
+toggles. It is only re-centred on launch, or if it ends up on no active
+output at all. The sway snippet sets `floating_modifier` for that, because a
+user config replaces `/etc/sway/config` instead of extending it and a config
+that never sets it leaves every floating window undraggable.
+
 `install.sh` symlinks the six scripts into `~/.local/bin`, scaffolds
 `~/.config/claude-dash/hosts` (all commented out), and prints the sway, waybar
 and CSS blocks to paste. Then `swaymsg reload`.

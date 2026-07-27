@@ -3,5 +3,10 @@
 # window is mapped, and foot then applies its own default geometry over the top,
 # so a `resize set` here is silently lost. claude-dash-toggle sizes and centres
 # the window after showing it instead (see CLAUDE_DASH_WIDTH / _HEIGHT).
+# A user sway config REPLACES /etc/sway/config rather than extending it, so a
+# config that never sets floating_modifier leaves every floating window
+# undraggable. Restore the distro default: Super+left-drag moves, right-drag
+# resizes. Drop this line if your config already sets it.
+floating_modifier $mod normal
 for_window [app_id="claude-dash"] floating enable, move scratchpad
 # <<< claude-dash
