@@ -158,6 +158,35 @@ merged=$(jq -n \
   def clean_entry:
     . + { host: (.host | clean), error: (.error | clean) };
 
+  # working/attention are re-derived HERE, from status/state alone, for every
+  # row -- local and remote alike -- rather than carried through from
+  # whatever the producer that emitted them claims. A remote sessions row
+  # came from that other hosts OWN claude-sessions binary, which can be an
+  # older or otherwise divergent build: it might not know about a status this
+  # build does (so it never sets attention for it), or it could just be
+  # wrong. Trusting that self-report would reopen exactly the hole this
+  # change closes -- an unrecognised status silently NOT read as attention --
+  # just moved one hop further out, to the remotes version instead of this
+  # one. So this is a full recompute, not a merge/OR against whatever
+  # arrived: a producer that over-claims (attention:true for a plain "busy")
+  # is corrected exactly as readily as one that under-claims. The same
+  # recompute is applied to LOCAL rows too, not only remote ones, so the rule
+  # is uniform regardless of where a row came from rather than trusting the
+  # local producer just because it is local -- it is, after all, invoked as
+  # an external command here ($LOCAL_PRODUCER), same as any other producer.
+  # This mirrors why stringify/clean above are duplicated from
+  # claude-sessions rather than shared: jq has no #include across separate
+  # bash scripts, and a merge point that ingests another hosts output is
+  # exactly the boundary that must not take a self-report on faith. Keep this
+  # in sync with working_status/attention_of in bin/claude-sessions.
+  def working_status($status):
+    $status == "busy" or $status == "shell" or $status == "active";
+  def attention_of($status; $state):
+    ($state == "blocked") or ((working_status($status) or $status == "idle") | not);
+  def reclassify:
+    (.status // "idle") as $status | (.state // null) as $state
+    | . + { working: working_status($status), attention: attention_of($status; $state) };
+
   # A remote is a trust boundary: its cached response can be malformed --
   # not an object at all, or a `.sessions` that is not an array of objects.
   # Order matters below: each `and`/`or` only reaches its right side once
@@ -204,7 +233,8 @@ merged=$(jq -n \
       hosts: ([{ host: $local_host, kind: "local", fetched_at: $local_generated_at,
                   age_ms: 0, status: "fresh", error: null }]
               + ($all | map(.entry | clean_entry))),
-      sessions: ($local_sessions + ($all | map(.rows) | add // [] | map(clean_row))) }')
+      sessions: (($local_sessions | map(reclassify))
+                 + ($all | map(.rows) | add // [] | map(clean_row | reclassify))) }')
 rm -f "$local_sessions_file" "$caches_file" "$invalid_hosts_file"
 
 # --- trigger a refresh, never blocking on it --------------------------

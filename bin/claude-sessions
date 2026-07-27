@@ -58,11 +58,12 @@ cli_sessions() {
           name:    ((.name // "(unnamed)") | clean),
           cwd:     (.cwd // ""),
           status:  (.status // "idle"),
-          working: ((.status // "idle") | . == "busy" or . == "shell"),
+          working: (working_status(.status // "idle")),
           state:   (.state // null),
           needs:   null,
           idle_ms: null,
-          job_id:  (.id // null) } ]
+          job_id:  (.id // null),
+          attention: (attention_of(.status // "idle"; .state // null)) } ]
     | map(. + { finished: (.kind == "bg" and (.state == "done" or .state == "error")) })
     | sort_by( (if .finished then 1 else 0 end),
                (if .kind == "interactive" then 0 else 1 end),
@@ -103,8 +104,20 @@ fi
 # rendered into a Pango-markup tooltip and a terminal frame, so strip
 # control characters and escape markup once, here, for every consumer --
 # including cli_sessions()'s CLI-fallback path above, which sources this too.
-# `shell` means the session is running a command, so it counts as working.
-# Derived once here; no consumer re-derives it from .status.
+# `shell` and `active` mean the session is doing something, so they count as
+# working. Derived once here; no consumer re-derives it from .status.
+#
+# The three-way classification (working / idle / attention) is likewise
+# derived exactly once, here, for every record this script emits -- a live
+# session, a job_row, and cli_sessions()'s CLI-fallback rows alike -- and no
+# consumer downstream (claude-dash-badge, claude-dash) may recompute it from
+# .status/.state itself. A status Claude Code has not invented yet must never
+# silently fall into "idle" the way it used to: `working_status` names the
+# ONLY statuses that count as working, so anything else -- `waiting`, a typo,
+# a future release's new status -- reads as attention by construction, not by
+# an exhaustive blocklist that always lags one release behind. `state ==
+# "blocked"` forces attention regardless of status, since a blocked agent is
+# waiting on the user even while its status still says "busy".
 # shellcheck disable=SC2016 # single-quoted on purpose: these are jq $vars, not bash's
 JQ_CLEAN_DEF='
 def clean:
@@ -117,8 +130,12 @@ def clean:
   else gsub("[[:cntrl:]  ]"; "")
        | gsub("&"; "&amp;") | gsub("<"; "&lt;") | gsub(">"; "&gt;")
   end;
+def working_status($status):
+  $status == "busy" or $status == "shell" or $status == "active";
+def attention_of($status; $state):
+  ($state == "blocked") or ((working_status($status) or $status == "idle") | not);
 def rank:
-  if .state == "blocked" then 0
+  if .attention then 0
   elif .working then 1
   else 2 end;
 '
@@ -139,18 +156,19 @@ def record:
       name:    (($s.name // "(unnamed)") | clean),
       cwd:     (($s.cwd // "") | clean),
       status:  ($s.status // "idle"),
-      working: (($s.status // "idle") | . == "busy" or . == "shell"),
+      working: (working_status($s.status // "idle")),
       state:   ($j.state // null),
       # $j comes from $jobs (== jobs_map, projected from job_rows below), whose
       # needs text already went through `clean` inside job_row -- cleaning it
       # again here would double-escape markup (`&lt;` -> `&amp;lt;`).
       needs:   ($j.needs // null),
       idle_ms: ($now - ($s.statusUpdatedAt // $s.updatedAt // $now)),
-      job_id:  ($s.jobId // null) }
+      job_id:  ($s.jobId // null),
+      attention: (attention_of($s.status // "idle"; $j.state // null)) }
   | . + { finished: (.kind == "bg" and (.state == "done" or .state == "error")) };
 # Display order, applied to the assembled array identically on the batch and
 # per-file fallback paths: unfinished before finished, interactive before
-# background, then blocked before busy before idle, then most recently
+# background, then attention before working before idle, then most recently
 # active first.
 def order:
   sort_by( (if .finished then 1 else 0 end),
@@ -164,19 +182,25 @@ def order:
 # epoch-ms timestamp (in practice it is an ISO-8601 string).
 def job_row($id; $mt):
   . as $j
+  # A state.json with no usable `.state` (an empty object, or a file caught
+  # mid-write) must not read as busy forever: with no tempo and no state,
+  # $status falls back to "idle", and "idle" is never working. Beyond that
+  # fallback, $status is classified through the same working_status/
+  # attention_of rules as every other record -- a job tempo/state this tool
+  # does not recognise (not busy/shell/active/idle, and not blocked) reads as
+  # attention, not as working-by-default the way an unrecognised state used to.
+  | ($j.tempo // $j.state // "idle") as $status
   | { kind:    "bg",
       pid:     null,
       name:    (($j.name // $id) | clean),
       cwd:     (($j.cwd // "") | clean),
-      # A state.json with no usable `.state` (an empty object, or a file
-      # caught mid-write) must not read as busy forever: only a state we
-      # recognise as active makes the row working, never an absent one.
-      status:  ($j.tempo // $j.state // "idle"),
-      working: (($j.state // null) as $st | ($st != null and $st != "blocked" and $st != "done" and $st != "error")),
+      status:  $status,
+      working: (working_status($status)),
       state:   ($j.state // null),
       needs:   (($j.needs // null) | clean),
       idle_ms: ($now - (if ($j.updatedAt | type) == "number" then $j.updatedAt else $mt end)),
-      job_id:  $id }
+      job_id:  $id,
+      attention: (attention_of($status; $j.state // null)) }
   | . + { finished: (.state == "done" or .state == "error") };
 '
 
