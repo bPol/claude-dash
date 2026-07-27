@@ -174,7 +174,7 @@ blanks the whole dashboard" was a real defect twice over.
 ## Tests
 
 ```sh
-./tests/run.sh          # 353 checks; no sway, network or Claude Code session needed
+./tests/run.sh          # 355 checks; no sway, network or Claude Code session needed
 shellcheck -x bin/* install.sh tests/*.sh
 ```
 

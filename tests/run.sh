@@ -2163,6 +2163,25 @@ check "unparked window is moved to the scratchpad first" \
 check "move precedes show" \
   "$(printf '%s' "$log" | grep -n 'move scratchpad\|scratchpad show' | head -1 | grep -c move)" "1"
 
+# waybar is started by sway with a minimal PATH that has no ~/.local/bin. The
+# toggle must therefore resolve the board as a sibling of itself rather than via
+# PATH -- when it did not, every click died with "not on PATH" before launching
+# anything, while the same click worked from a shell with a richer PATH. Note
+# this deliberately does NOT set CLAUDE_DASH_BOARD: that override is what masked
+# the bug in every other toggle test.
+d_np=$(mktemp -d "${TMPDIR:-/tmp}/claude-dash-nopath.XXXXXX")
+tree_json absent false >"$d_np/tree.json"
+: >"$d_np/log"
+PATH="$STUB_BIN:/usr/bin:/bin" STUB_TREE=$d_np/tree.json STUB_LOG=$d_np/log \
+  CLAUDE_DASH_PIDFILE=$d_np/board.pid timeout 5 "$BIN/claude-dash-toggle" \
+  >/dev/null 2>&1
+np_log=$(cat "$d_np/log")
+check "launches without the board on PATH (waybar's environment)" \
+  "$(printf '%s' "$np_log" | grep -c '^foot ')" "1"
+check "launch names the board by absolute path, not a bare command" \
+  "$(printf '%s' "$np_log" | grep -c "^foot .*$(cd "$BIN" && pwd)/claude-dash$")" "1"
+rm -rf "$d_np"
+
 # No board running for this case, so no stand-in process and no pidfile.
 log=$(CLAUDE_DASH_NO_BOARD=1 run_toggle absent false); TOGGLE_RC=$?
 check "absent window launches the board" \

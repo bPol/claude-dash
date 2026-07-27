@@ -3,7 +3,12 @@
 set -uo pipefail
 
 APP_ID=claude-dash
-BOARD=${CLAUDE_DASH_BOARD:-claude-dash}
+# Resolve the board as a sibling of this script, NOT via PATH. waybar is
+# started by sway with a minimal PATH that has no ~/.local/bin, so a bare
+# `command -v claude-dash` fails and every click dies before launching
+# anything -- while the same click works from a shell whose PATH is richer.
+HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")")" && pwd)
+BOARD=${CLAUDE_DASH_BOARD:-$HERE/claude-dash}
 PIDFILE=${CLAUDE_DASH_PIDFILE:-${XDG_RUNTIME_DIR:-/tmp}/claude-dash.pid}
 BOARD_WIDTH=${CLAUDE_DASH_WIDTH:-900}
 BOARD_HEIGHT=${CLAUDE_DASH_HEIGHT:-520}
@@ -86,7 +91,8 @@ if [[ $state != absent ]]; then
 fi
 
 command -v foot >/dev/null 2>&1 || { notify "foot is not installed"; exit 1; }
-command -v "$BOARD" >/dev/null 2>&1 || { notify "$BOARD is not on PATH — run install.sh"; exit 1; }
+[[ -x $BOARD ]] || command -v "$BOARD" >/dev/null 2>&1 || {
+  notify "board not found at $BOARD — run install.sh"; exit 1; }
 
 # Two clicks in quick succession both see an absent window and would each launch
 # a board, leaving two processes and two windows. Serialise the launch branch
