@@ -174,12 +174,32 @@ blanks the whole dashboard" was a real defect twice over.
 ## Tests
 
 ```sh
-./tests/run.sh          # 355 checks; no sway, network or Claude Code session needed
+./tests/run.sh          # 379 checks; no sway, network or Claude Code session needed
 shellcheck -x bin/* install.sh tests/*.sh
 ```
 
 The suite is hermetic: stubs for `ssh` and `swaymsg`, fixture registries, and no
 path to the real `claude` binary or your real cache.
+
+## Colour
+
+The board colours each session row by its group, using the same kanagawa
+palette `config/waybar.style.css` uses, so the bar and the board agree:
+attention rows are surimiOrange, working rows crystalBlue, idle rows fujiGray.
+A remote host heading is bold (default foreground) when reachable, or
+samuraiRed when `unreachable`; the same red marks the board's own `⚠ degraded`
+/ `⚠ N unreadable` warnings and any "could not parse"/"no data" error text. The
+`… N finished` collapse line and the `q close` footer are dim.
+
+Colour is applied only after `jq` finishes all width/truncation math on plain
+text — a rendered line's visible content is identical whether colour is on or
+off, so colour can never corrupt the layout.
+
+`CLAUDE_DASH_COLOR` controls *when*: `auto` (default) colours only when stdout
+is a terminal, `always` forces it on, `never` forces it off. `NO_COLOR`
+(<https://no-color.org>; any non-empty value counts) always wins, even over an
+explicit `CLAUDE_DASH_COLOR=always` — it is a blanket opt-out, not one this
+tool's own switch gets to override.
 
 ## Environment
 
@@ -198,6 +218,8 @@ path to the real `claude` binary or your real cache.
 | `CLAUDE_DASH_WIDTH` | `900` | Board window width, applied each time it is shown. |
 | `CLAUDE_DASH_HEIGHT` | `520` | Board window height, applied each time it is shown. |
 | `CLAUDE_DASH_HOST` | `uname -n` | Overrides the hostname shown in header and tooltip. |
+| `CLAUDE_DASH_COLOR` | `auto` | `auto`\|`always`\|`never` — when the board colours its output. `auto` colours only when stdout is a terminal. |
+| `NO_COLOR` | unset | Any non-empty value forces colour off, overriding `CLAUDE_DASH_COLOR=always`. See <https://no-color.org>. |
 | `CLAUDE_DASH_BIN_DIR` | `~/.local/bin` | Where `install.sh` symlinks scripts. |
 | `CLAUDE_DASH_HOSTS` | `~/.config/claude-dash/hosts` | Remote host list. |
 | `CLAUDE_DASH_CACHE` | `${XDG_CACHE_HOME:-~/.cache}/claude-dash` | One `<host>.json` per remote. |

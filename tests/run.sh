@@ -2275,4 +2275,144 @@ check "--remote also links only claude-sessions" \
   "$([[ -L $bin_dir/claude-sessions ]] && echo yes || echo no)" "yes"
 rm -rf "$root" "$min_path_dir"
 
+printf '\nclaude-dash board: colour\n'
+
+# Fixture with one row of each colour-relevant group (working, attention,
+# idle), plus enough width for no truncation to interfere with the escape
+# checks below.
+p=$(producer_stub '[
+  {"kind":"interactive","pid":1,"name":"working row","cwd":"/x","status":"busy","working":true,"attention":false,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false},
+  {"kind":"bg","pid":3,"name":"attention row","cwd":"/x","status":"idle","working":false,"attention":true,"state":"blocked","needs":"need?","idle_ms":1000,"job_id":"j","finished":false},
+  {"kind":"interactive","pid":4,"name":"idle row","cwd":"/x","status":"idle","working":false,"attention":false,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
+
+# 1. Colour forced off must reproduce today's plain output exactly -- the
+# baseline regression guard. (Command substitution already makes stdout a
+# pipe, not a tty, so `auto`'s own non-tty branch trivially agrees with
+# `never`; this test forces `never` explicitly so it does not depend on that.)
+off=$(COLUMNS=100 CLAUDE_DASH_COLOR=never CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash" --once)
+plain=$(COLUMNS=100 CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash" --once)
+check "colour forced off matches today's plain (auto, non-tty) output byte for byte" \
+  "$off" "$plain"
+
+# 2. Colour forced on: an attention row carries the surimiOrange escape, a
+# working row carries crystalBlue, an idle row carries fujiGray -- and, in
+# each case, the OTHER two colours are absent from that row's own line, so
+# this is checking the right row got the right colour, not just that some
+# escape appears somewhere in the frame.
+on=$(COLUMNS=100 CLAUDE_DASH_COLOR=always CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash" --once)
+attention_line=$(grep 'attention row' <<<"$on")
+working_line=$(grep 'working row' <<<"$on")
+idle_line=$(grep 'idle row' <<<"$on")
+check "an attention row is wrapped in the surimiOrange escape" \
+  "$(grep -c $'\033\[38;2;255;160;102m' <<<"$attention_line")" "1"
+check "an attention row's line does not also carry the working colour" \
+  "$(grep -c $'\033\[38;2;126;156;216m' <<<"$attention_line")" "0"
+check "an attention row's line does not also carry the idle colour" \
+  "$(grep -c $'\033\[38;2;114;113;105m' <<<"$attention_line")" "0"
+check "a working row is wrapped in the crystalBlue escape" \
+  "$(grep -c $'\033\[38;2;126;156;216m' <<<"$working_line")" "1"
+check "a working row's line does not also carry the idle colour" \
+  "$(grep -c $'\033\[38;2;114;113;105m' <<<"$working_line")" "0"
+check "an idle row is wrapped in the fujiGray escape" \
+  "$(grep -c $'\033\[38;2;114;113;105m' <<<"$idle_line")" "1"
+check "an idle row's line does not also carry the working colour" \
+  "$(grep -c $'\033\[38;2;126;156;216m' <<<"$idle_line")" "0"
+
+# 3. The layout-corruption canary: with colour forced on, stripping every
+# escape sequence from the frame must reproduce the plain frame exactly,
+# line for line. If a class token ever leaked into the width-truncated text,
+# or truncation ever sliced an escape sequence in half, this is what would
+# catch it.
+check "colour-on frame, escapes stripped, is byte-identical to the plain frame" \
+  "$(strip_ansi <<<"$on")" "$plain"
+rm -rf "$(dirname "$p")"
+
+# 4. No line's visible width may exceed the terminal width once colour is on,
+# at a range of widths including ones narrow enough that the mid-column
+# arithmetic goes negative (see the existing narrow-width truncation test
+# above) -- colour must never be the thing that pushes a line over budget.
+p=$(producer_stub '[
+  {"kind":"interactive","pid":1,"name":"a very long session name that will definitely need truncating","cwd":"/x","status":"busy","working":true,"attention":false,"state":null,"needs":null,"idle_ms":120000,"job_id":null,"finished":false},
+  {"kind":"bg","pid":3,"name":"typo clarification","cwd":"/x","status":"idle","working":false,"attention":true,"state":"blocked","needs":"did you mean exit or edit, or something else entirely that runs well past any column width","idle_ms":360000,"job_id":"j","finished":false}]')
+for w in 40 60 100 200; do
+  frame=$(COLUMNS=$w CLAUDE_DASH_COLOR=always CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash" --once)
+  check "colour-on: no line's visible width exceeds $w columns" \
+    "$(strip_ansi <<<"$frame" | awk -v w="$w" 'length > w' | wc -l)" "0"
+done
+rm -rf "$(dirname "$p")"
+
+# 5. NO_COLOR (https://no-color.org) takes precedence over an explicit
+# CLAUDE_DASH_COLOR=always: this tool's own opt-in switch does not get to
+# override the user's blanket opt-out.
+p=$(producer_stub '[{"kind":"interactive","pid":1,"name":"working row","cwd":"/x","status":"busy","working":true,"attention":false,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
+no_color_frame=$(COLUMNS=100 NO_COLOR=1 CLAUDE_DASH_COLOR=always CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash" --once)
+check "NO_COLOR beats CLAUDE_DASH_COLOR=always: no escape sequence appears" \
+  "$(grep -cE $'\033\\[[0-9;]*m' <<<"$no_color_frame")" "0"
+# Any non-empty value counts, per the spec -- not just "1".
+no_color_frame2=$(COLUMNS=100 NO_COLOR=whatever CLAUDE_DASH_COLOR=always CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash" --once)
+check "NO_COLOR with any non-empty value (not just 1) also suppresses colour" \
+  "$(grep -cE $'\033\\[[0-9;]*m' <<<"$no_color_frame2")" "0"
+rm -rf "$(dirname "$p")"
+
+# 6. auto is the default, and with stdout captured through command
+# substitution (exactly how every test above already captures output),
+# stdout is not a tty -- so auto must produce no escapes at all, with
+# CLAUDE_DASH_COLOR left unset entirely.
+p=$(producer_stub '[{"kind":"interactive","pid":1,"name":"working row","cwd":"/x","status":"busy","working":true,"attention":false,"state":null,"needs":null,"idle_ms":1000,"job_id":null,"finished":false}]')
+auto_frame=$(COLUMNS=100 CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash" --once)
+check "auto mode (default, non-tty stdout) produces no escape sequences" \
+  "$(grep -cE $'\033\\[[0-9;]*m' <<<"$auto_frame")" "0"
+rm -rf "$(dirname "$p")"
+
+# The title line's warning clause is red, but only the "⚠ ..." clause -- the
+# hostname portion of the very same line must stay uncoloured, proving the
+# title line's colour split lands at the right character, not on the whole
+# line.
+d=$(mktemp -d "${TMPDIR:-/tmp}/claude-dash-prod.XXXXXX")
+{ printf '#!/usr/bin/env bash\ncat <<'"'"'JSON'"'"'\n'
+  jq -n '{host:"testbox",generated_at:0,degraded:true,unreadable:2,sessions:[]}'
+  printf 'JSON\n'; } >"$d/producer"
+chmod +x "$d/producer"
+frame=$(COLUMNS=100 CLAUDE_DASH_COLOR=always CLAUDE_DASH_PRODUCER=$d/producer "$BIN/claude-dash" --once)
+title_line=$(grep 'claude sessions' <<<"$frame")
+check "the degraded warning on the title line is coloured samuraiRed" \
+  "$(grep -c $'\033\[38;2;232;36;36m' <<<"$title_line")" "1"
+check "the hostname on the title line appears before the first colour escape, not inside it" \
+  "$([[ "${title_line%%$'\033'*}" == *testbox* ]] && echo yes || echo no)" "yes"
+check "stripped, the degraded title line still matches the plain rendering" \
+  "$(strip_ansi <<<"$title_line")" \
+  "$(grep 'claude sessions' <<<"$(COLUMNS=100 CLAUDE_DASH_PRODUCER=$d/producer "$BIN/claude-dash" --once)")"
+rm -rf "$d"
+
+# An unreachable remote host's heading is samuraiRed in full (it IS the error
+# text for that host); a reachable (stale) remote host's heading is bold
+# default instead -- never the same colour as an unreachable one.
+p=$(multi_producer_stub \
+  '[{"host":"local-box","kind":"local","fetched_at":0,"age_ms":0,"status":"fresh","error":null},
+    {"host":"stale-pc","kind":"remote","fetched_at":0,"age_ms":180000,"status":"stale","error":null},
+    {"host":"down-pc","kind":"remote","fetched_at":0,"age_ms":600000,"status":"unreachable","error":"unreachable (dns)"}]' \
+  '[]')
+frame=$(COLUMNS=100 CLAUDE_DASH_COLOR=always CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash" --once)
+down_line=$(grep 'down-pc' <<<"$frame")
+stale_line=$(grep 'stale-pc' <<<"$frame")
+check "an unreachable host heading is wrapped in samuraiRed" \
+  "$(grep -c $'\033\[38;2;232;36;36m' <<<"$down_line")" "1"
+check "a stale (reachable) host heading is bold, not samuraiRed" \
+  "$(grep -c $'\033\[38;2;232;36;36m' <<<"$stale_line")" "0"
+check "a stale (reachable) host heading does carry the bold escape" \
+  "$(grep -c $'\033\[1m' <<<"$stale_line")" "1"
+rm -rf "$(dirname "$p")"
+
+# The "… N finished" collapse line and the "q close" footer are dim.
+p=$(producer_stub '[
+  {"kind":"bg","pid":4,"name":"done job","cwd":"/x","status":"idle","working":false,"attention":false,"state":"done","needs":null,"idle_ms":950400000,"job_id":"k","finished":true}]')
+frame=$(COLUMNS=100 CLAUDE_DASH_COLOR=always CLAUDE_DASH_PRODUCER=$p "$BIN/claude-dash" --once)
+finished_line=$(grep 'finished' <<<"$frame")
+qclose_line=$(grep 'q close' <<<"$frame")
+check "the finished-collapse line is dim" \
+  "$(grep -c $'\033\[2m' <<<"$finished_line")" "1"
+check "the q close footer is dim" \
+  "$(grep -c $'\033\[2m' <<<"$qclose_line")" "1"
+rm -rf "$(dirname "$p")"
+
 summary
