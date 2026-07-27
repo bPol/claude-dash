@@ -195,6 +195,8 @@ path to the real `claude` binary or your real cache.
 | `CLAUDE_DASH_PIDFILE` | `$XDG_RUNTIME_DIR/claude-dash.pid` | How the toggle finds the board to signal it. Board and toggle must agree. |
 | `CLAUDE_DASH_STAMP` | `$XDG_RUNTIME_DIR/claude-dash-arbitrated` | Rate-limit stamp for the fallback cross-check. |
 | `CLAUDE_DASH_BOARD` | `claude-dash` | Board command the toggle launches. |
+| `CLAUDE_DASH_WIDTH` | `900` | Board window width, applied each time it is shown. |
+| `CLAUDE_DASH_HEIGHT` | `520` | Board window height, applied each time it is shown. |
 | `CLAUDE_DASH_HOST` | `uname -n` | Overrides the hostname shown in header and tooltip. |
 | `CLAUDE_DASH_BIN_DIR` | `~/.local/bin` | Where `install.sh` symlinks scripts. |
 | `CLAUDE_DASH_HOSTS` | `~/.config/claude-dash/hosts` | Remote host list. |

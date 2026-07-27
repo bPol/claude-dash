@@ -5,6 +5,8 @@ set -uo pipefail
 APP_ID=claude-dash
 BOARD=${CLAUDE_DASH_BOARD:-claude-dash}
 PIDFILE=${CLAUDE_DASH_PIDFILE:-${XDG_RUNTIME_DIR:-/tmp}/claude-dash.pid}
+BOARD_WIDTH=${CLAUDE_DASH_WIDTH:-900}
+BOARD_HEIGHT=${CLAUDE_DASH_HEIGHT:-520}
 LOCKFILE=$PIDFILE.lock
 
 notify() {
@@ -53,6 +55,17 @@ signal_board() {
   kill -"$1" "$pid" 2>/dev/null || true
 }
 
+# place_window — size and centre the board on whichever output is focused.
+# Done here rather than in the sway `for_window` rule because that rule runs the
+# instant the window is mapped, and foot then applies its own default geometry
+# on top, so the rule's `resize set` is silently lost. Re-applying on every show
+# also means the board follows you between monitors instead of reappearing at
+# whatever coordinates it was last left at.
+place_window() {
+  swaymsg "[app_id=\"$APP_ID\"] resize set ${BOARD_WIDTH}px ${BOARD_HEIGHT}px" >/dev/null 2>&1
+  swaymsg "[app_id=\"$APP_ID\"] move position center" >/dev/null 2>&1
+}
+
 command -v swaymsg >/dev/null 2>&1 || { notify "swaymsg not found — not running under sway"; exit 1; }
 command -v jq      >/dev/null 2>&1 || { notify "jq is not installed"; exit 1; }
 
@@ -68,7 +81,7 @@ if [[ $state != absent ]]; then
   # `scratchpad show` on an already-visible scratchpad window hides it, so this
   # single command is the whole toggle.
   swaymsg "[app_id=\"$APP_ID\"] scratchpad show" >/dev/null 2>&1
-  if visible; then signal_board USR2; else signal_board USR1; fi
+  if visible; then place_window; signal_board USR2; else signal_board USR1; fi
   exit 0
 fi
 
@@ -100,6 +113,7 @@ for _ in $(seq 20); do
   [[ $state == absent ]] && continue
   [[ $state == none ]] && swaymsg "[app_id=\"$APP_ID\"] move scratchpad" >/dev/null 2>&1
   swaymsg "[app_id=\"$APP_ID\"] scratchpad show" >/dev/null 2>&1
+  place_window
   signal_board USR2
   exit 0
 done

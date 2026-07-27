@@ -1,3 +1,7 @@
 # >>> claude-dash
-for_window [app_id="claude-dash"] floating enable, resize set 900 520, move scratchpad
+# Size and position are NOT set here on purpose: this rule fires the moment the
+# window is mapped, and foot then applies its own default geometry over the top,
+# so a `resize set` here is silently lost. claude-dash-toggle sizes and centres
+# the window after showing it instead (see CLAUDE_DASH_WIDTH / _HEIGHT).
+for_window [app_id="claude-dash"] floating enable, move scratchpad
 # <<< claude-dash

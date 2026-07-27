@@ -2141,10 +2141,21 @@ check "parked window is not moved again" \
   "$(printf '%s' "$log" | grep -c 'move scratchpad')" "0"
 check "showing a visible window signals the board to resume" \
   "$(printf '%s' "$log" | grep -c '^USR2$')" "1"
+# Geometry is applied by the toggle, not the sway for_window rule: that rule
+# fires the instant the window maps and foot then overrides it with its own
+# default size, so the board came up at 700x484 instead of the intended size.
+check "showing sizes the window explicitly" \
+  "$(printf '%s' "$log" | grep -c 'resize set 900px 520px')" "1"
+check "showing centres the window on the focused output" \
+  "$(printf '%s' "$log" | grep -c 'move position center')" "1"
+check "resize precedes centring" \
+  "$(printf '%s' "$log" | grep -n 'resize set\|move position center' | head -1 | grep -c resize)" "1"
 
 log=$(run_toggle fresh false)
 check "hiding signals the board to idle" \
   "$(printf '%s' "$log" | grep -c '^USR1$')" "1"
+check "hiding does not reposition the window" \
+  "$(printf '%s' "$log" | grep -c 'move position center')" "0"
 
 log=$(run_toggle none true)
 check "unparked window is moved to the scratchpad first" \
