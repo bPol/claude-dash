@@ -18,15 +18,86 @@ term_width() {
   tput cols 2>/dev/null || printf '80'
 }
 
-# frame WIDTH — render the current state as plain text on stdout.
+# COLOR_TTY is captured once, here, before frame() is ever called. frame()'s
+# output is captured via `$(frame ...)` in the refresh loop below, and inside
+# that command substitution stdout is a pipe, not a terminal — a `[[ -t 1 ]]`
+# check made *inside* frame() would therefore always read as "not a tty", even
+# when the real terminal outside is one. Checking once here, before any such
+# subshell exists, is what lets `auto` mode colour the live board and not just
+# `--once`.
+COLOR_TTY=0
+[[ -t 1 ]] && COLOR_TTY=1
+
+# use_color — true (exit 0) if the current frame should be coloured.
+# Precedence: NO_COLOR (https://no-color.org; any non-empty value) always
+# wins, even over an explicit CLAUDE_DASH_COLOR=always — the spec frames it as
+# an unconditional opt-out ("should prevent the addition of ANSI color"), not
+# one that defers to a tool's own colour switch. Otherwise CLAUDE_DASH_COLOR
+# selects always/never/auto, where auto colours only when stdout is a
+# terminal (see COLOR_TTY above).
+use_color() {
+  [[ -n ${NO_COLOR:-} ]] && return 1
+  case ${CLAUDE_DASH_COLOR:-auto} in
+    always) return 0 ;;
+    never)  return 1 ;;
+    *)      [[ $COLOR_TTY -eq 1 ]] ;;
+  esac
+}
+
+# color_for CLASS TEXT — wrap TEXT in the SGR codes for CLASS. Colours are the
+# kanagawa palette config/waybar.style.css already uses, kept in sync by eye
+# (no shared source file between a CSS stylesheet and this bash script).
+# Truecolor SGR (`\e[38;2;R;G;Bm`) is used throughout; foot supports it.
+color_for() {
+  local class=$1 text=$2
+  case $class in
+    A) printf '\e[38;2;255;160;102m%s\e[0m\n' "$text" ;;  # attention: surimiOrange
+    W) printf '\e[38;2;126;156;216m%s\e[0m\n' "$text" ;;   # working: crystalBlue
+    I) printf '\e[38;2;114;113;105m%s\e[0m\n' "$text" ;;   # idle: fujiGray
+    H) printf '\e[1m%s\e[0m\n' "$text" ;;                  # host heading: bold, default fg
+    E) printf '\e[38;2;232;36;36m%s\e[0m\n' "$text" ;;     # error/unreachable: samuraiRed
+    D) printf '\e[2m%s\e[0m\n' "$text" ;;                  # dim: finished line, footer
+    T)
+      # The title line: plain except for a trailing "⚠ ..." warning clause
+      # (degraded / unreadable), which gets the same red as any other error
+      # text. This is the one line that mixes coloured and uncoloured spans,
+      # so it is split at the first warning glyph instead of getting its own
+      # single-colour class.
+      if [[ $text == *"⚠"* ]]; then
+        printf '%s\e[38;2;232;36;36m⚠%s\e[0m\n' "${text%%⚠*}" "${text#*⚠}"
+      else
+        printf '%s\n' "$text"
+      fi
+      ;;
+    *) printf '%s\n' "$text" ;;
+  esac
+}
+
+# colorize — read "CLASS<TAB>TEXT" lines from stdin (one per rendered board
+# line, as jq emits them) and print either TEXT unchanged (colour off) or TEXT
+# wrapped in CLASS's colour (colour on). The tab-prefixed class token exists so
+# jq can keep doing ALL width/truncation math ($midw, $w, pad()) on plain
+# visible text only — colour is applied here, strictly after that math, so it
+# can never be counted as part of a line's width or be sliced in half by
+# truncation.
+colorize() {
+  local use=$1 class text
+  while IFS=$'\t' read -r class text; do
+    if [[ $use -eq 1 ]]; then color_for "$class" "$text"; else printf '%s\n' "$text"; fi
+  done
+}
+
+# frame WIDTH — render the current state as plain text (optionally coloured)
+# on stdout.
 frame() {
-  local width=$1 data
+  local width=$1 data lines colour=0
+  use_color && colour=1
   data=$("$PRODUCER" 2>/dev/null) || data=''
   if [[ -z $data ]]; then
-    printf ' claude sessions\n\n ⚠ no data — the producer failed\n'
+    printf '-\t claude sessions\n-\t\nE\t ⚠ no data — the producer failed\n' | colorize "$colour"
     return
   fi
-  jq -r --argjson w "$width" '
+  lines=$(jq -r --argjson w "$width" '
     # A backwards clock step (NTP correction, suspend/resume drift) can make a
     # fetched_at/updatedAt look like it is in the future, yielding a negative
     # duration -- clamp at 0 rather than render a nonsensical "-3600s ago".
@@ -62,9 +133,22 @@ frame() {
     # named status_label, not label: jq 1.7 reserves `label` as a keyword
     # (for `label $out | ... break $out`), so `def label:` is a syntax error.
     def status_label: (.state // .status);
+    # rowclass mirrors glyph 1:1 (attention/working/idle), kept separate
+    # because glyph is a display character and this is a colour-class token
+    # meant for the bash side, never rendered itself.
+    def rowclass:
+      if .attention then "A"
+      elif .working then "W"
+      else "I" end;
+    # Every emitted line is {c: CLASS, t: TEXT} from here down, not a plain
+    # string: $w-truncation below runs on .t only, so a class token can never
+    # be counted against a rendered width or be sliced in half by it. Colour
+    # is applied by the bash side afterwards, from the "CLASS<TAB>TEXT" this
+    # produces -- see colorize()/color_for() above.
     def row($midw):
-      "  \(glyph) \(status_label | pad(8)) \(.name | pad(24)) " +
-      "\(((.needs // .cwd) | pad($midw))) \(.idle_ms | age)";
+      { c: rowclass,
+        t: ("  \(glyph) \(status_label | pad(8)) \(.name | pad(24)) " +
+            "\(((.needs // .cwd) | pad($midw))) \(.idle_ms | age)") };
 
     ($w - 46) as $midw
     # `.hosts` only exists on claude-sessions-all output; a plain
@@ -92,33 +176,41 @@ frame() {
         | ($hlive | map(select(.kind == "interactive"))) as $inter
         | ($hlive | map(select(.kind == "bg")))          as $bg
         | ( (if $hd.kind == "local" then [] else
-               [ " " + $hd.host
-                 + (if $hd.status == "unreachable" then
-                      "  unreachable" + (if $hd.error then ": \($hd.error)" else "" end)
-                    elif $hd.status == "stale" then
-                      "  (\($hd.age_ms | age) ago)"
-                    else "" end) ]
+               # A host heading is red ("E") when unreachable -- it IS the
+               # error text for that host, not just a line that mentions one
+               # -- and bold-default ("H") otherwise (fresh or stale).
+               [ { c: (if $hd.status == "unreachable" then "E" else "H" end),
+                   t: (" " + $hd.host
+                       + (if $hd.status == "unreachable" then
+                            "  unreachable" + (if $hd.error then ": \($hd.error)" else "" end)
+                          elif $hd.status == "stale" then
+                            "  (\($hd.age_ms | age) ago)"
+                          else "" end)) } ]
              end)
           + (if ($inter | length) > 0
-             then [" INTERACTIVE"] + ($inter | map(row($midw))) + [""] else [] end)
+             then [{c:"-", t:" INTERACTIVE"}] + ($inter | map(row($midw))) + [{c:"-", t:""}] else [] end)
           + (if ($bg | length) > 0
-             then [" BACKGROUND"]  + ($bg    | map(row($midw))) + [""] else [] end)
+             then [{c:"-", t:" BACKGROUND"}]  + ($bg    | map(row($midw))) + [{c:"-", t:""}] else [] end)
           + (if ($hdone | length) > 0
-             then ["   … \($hdone | length) finished (\($hdone | map(.name) | join(", ")))"]
+             then [{c:"D", t:"   … \($hdone | length) finished (\($hdone | map(.name) | join(", ")))"}]
              else [] end)
         )
       )) as $blocks
-    | [ " claude sessions · \($top_host)" +
-        (if .degraded then "   ⚠ degraded (CLI fallback)" else "" end) +
-        (if .unreadable > 0 then "   ⚠ \(.unreadable) unreadable" else "" end),
-        "   \($nworking) working · \($nattention) attention · \($nidle) idle",
-        "" ]
+    # The title line is class "T": mostly plain, but color_for() reddens a
+    # trailing "⚠ ..." warning clause (degraded / unreadable) when present --
+    # see color_for() above for why that line alone is handled that way.
+    | [ {c:"T", t: (" claude sessions · \($top_host)" +
+          (if .degraded then "   ⚠ degraded (CLI fallback)" else "" end) +
+          (if .unreadable > 0 then "   ⚠ \(.unreadable) unreadable" else "" end))},
+        {c:"-", t: "   \($nworking) working · \($nattention) attention · \($nidle) idle"},
+        {c:"-", t: ""} ]
       + ($blocks | flatten)
-      + (if ($live | length) == 0 then ["   no sessions running", ""] else [] end)
-      + ["", "   q close"]
+      + (if ($live | length) == 0 then [{c:"-", t:"   no sessions running"}, {c:"-", t:""}] else [] end)
+      + [{c:"-", t:""}, {c:"D", t:"   q close"}]
       | .[]
-      | .[0:$w]' <<<"$data" 2>/dev/null \
-    || printf ' claude sessions\n\n ⚠ could not parse producer output\n'
+      | .c + "\t" + (.t | .[0:$w])' <<<"$data" 2>/dev/null) \
+    || lines=$'-\t claude sessions\n-\t\nE\t ⚠ could not parse producer output'
+  printf '%s\n' "$lines" | colorize "$colour"
 }
 
 if [[ ${1:-} == "--once" ]]; then

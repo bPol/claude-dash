@@ -101,6 +101,15 @@ mk_cache_file() {
     >"$dir/$host.json"
 }
 
+# strip_ansi -- read stdin, drop every SGR escape sequence (`\e[...m`),
+# print the visible text that remains. Used by the colour tests to assert
+# that a coloured frame's visible content matches an uncoloured one exactly.
+strip_ansi() {
+  local esc
+  esc=$(printf '\033')
+  sed "s/${esc}\[[0-9;]*m//g"
+}
+
 # check DESCRIPTION ACTUAL EXPECTED
 check() {
   TESTS_RUN=$((TESTS_RUN + 1))
